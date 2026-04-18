@@ -134,6 +134,22 @@ class BetterFormatter(logging.Formatter):
         else:
             return f"{now} {level_name:<7} [{module:^10}] {req_id[:8] if req_id else ''} {message}{exc_text}"
 
+class _NoiseFilter(logging.Filter):
+    """屏蔽 UI 高频轮询接口的访问日志，避免刷屏"""
+    NOISY_SUBSTRINGS = (
+        "/proxy-manager/status",
+        "/proxy-manager/logs",
+        "/proxy-manager/ip-check",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return not any(p in msg for p in self.NOISY_SUBSTRINGS)
+
+
 class LoggerManager:
     _instance = None
     
@@ -158,6 +174,7 @@ class LoggerManager:
         console = logging.StreamHandler(sys.stdout)
         console.setFormatter(BetterFormatter())
         console.setLevel(self._log_level)
+        console.addFilter(_NoiseFilter())
         root.addHandler(console)
 
         # 屏蔽噪音
