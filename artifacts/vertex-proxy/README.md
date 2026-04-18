@@ -8,12 +8,15 @@
 
 - **OpenAI 兼容接口**：`/v1/chat/completions`、`/v1/models`，无缝替换 OpenAI API
 - **免费 Gemini 访问**：通过 Google Cloud 控制台的匿名接口，不消耗 Gemini API 配额
-- **SOCKS5 代理轮换**：内置 xray 代理管理，支持 Clash 订阅节点，自动轮换 IP 避免单 IP 配额耗尽
+- **SOCKS5 代理轮换**：内置 xray 代理管理，支持多条订阅链接、节点自动轮换
 - **浏览器 TLS 指纹伪装**：使用 primp（Rust 静态链接 BoringSSL），通过 Google 的浏览器检测
-- **假流式模式（fs- 前缀）**：非流式底层 + 模拟逐字输出，解决 batchGraphql 接口本身不支持真流式的问题
-- **空回复自动重试**：检测到 Gemini 返回空内容时自动换节点重试，确保客户端收到有效回复
-- **节点耗尽自动重拉**：50 个节点全部轮换一圈后自动重新拉取订阅，获取新 IP 列表，无需手动干预
-- **Web 管理界面**：`/proxy-manager`，可切换节点、查看日志、添加自定义节点
+- **假流式模式（fs- 前缀）**：非流式底层 + 模拟逐字输出，解决 batchGraphql 不支持真流式的问题
+- **空回复自动重试**：检测到 Gemini 返回空内容时自动换节点重试
+- **节点耗尽自动重拉**：全部节点轮换一圈后自动重新拉取订阅获取新 IP 列表
+- **多订阅链接管理**：管理界面支持添加/删除多条订阅链接，刷新时合并所有链接的节点
+- **一键测速排序**：并发 TCP ping 所有节点，按延迟从低到高排序，自动选最优
+- **出口 IP 检查**：对比直连 IP 和代理 IP，判断节点是否真的换了出口
+- **Web 管理界面**：`/proxy-manager`，集中管理订阅、节点、测速、日志
 - **SillyTavern 兼容**：SSE 格式严格遵守 OpenAI 规范，禁用中间层压缩，防止解码错误
 
 ---
@@ -32,8 +35,8 @@
 
 服务会自动：
 1. 检测是否有保存的代理节点（生产环境每次部署是全新容器，所以首次启动没有）
-2. 拉取 Clash 订阅，获取节点列表（约 50 个节点）
-3. 依次尝试节点，选出第一个可用的（默认是 CF 官方优选）
+2. 拉取所有已保存的订阅链接，合并节点列表
+3. 依次尝试节点，选出第一个可用的
 4. 启动 xray 进程监听 `127.0.0.1:1080`
 
 ### 第三步：配置 API 密钥
@@ -56,6 +59,40 @@ sk-123456
 
 ---
 
+## 管理界面功能说明
+
+访问 `/proxy-manager` 打开管理界面，功能如下：
+
+### 订阅链接管理
+
+- 支持添加多条订阅链接（Clash YAML、base64 vless/vmess 列表、明文 vless/vmess 列表均支持）
+- 点"＋ 添加"保存链接，点"🔄 刷新节点列表"从所有链接拉取并合并节点
+- 刷新后每条链接会显示拉取结果（✅ 成功几个节点 / ❌ 失败原因），不再静默失败
+- 链接保存在 `config/sub_urls.json`，服务重启后自动加载
+
+### 一键测速排序
+
+- 并发 TCP ping 所有节点的 server:port，几秒内测完全部节点
+- 测完后节点列表按延迟从低到高重新排序
+- 延迟颜色：绿色 < 100ms，黄色 100~300ms，红色 > 300ms
+- 最优节点标 👑，点"🏆 选最优节点"一键连接
+
+> **注意（CF 节点特有现象）**：如果你订阅里全是 CF 优选节点，测速结果可能显示所有节点延迟一样（例如都是 29ms）。这是正常的——CF 使用任播网络，TCP ping 打过去都连到最近的同一个 CF 机房，所以延迟相同，并不是代码有问题。TCP ping 在这里的价值是检测哪些节点完全不可达（超时），而不是区分 CF 节点之间的性能差异。
+
+### 出口 IP 检查
+
+- 点"🌐 查看出口 IP"，同时测直连 IP 和代理 IP
+- 如果两个 IP 相同，说明代理节点实际上没有改变 Google 看到的 IP
+- 如果不同，说明代理确实在换出口
+
+### 自定义节点
+
+- 支持粘贴 vless:// 或 vmess:// 链接
+- 支持粘贴完整 xray JSON 配置（含 TLS 分片 fragment）
+- 自定义节点保存在 `config/custom_nodes.json`，不受订阅刷新影响
+
+---
+
 ## 上传到 GitHub
 
 ```bash
@@ -70,6 +107,7 @@ git push -u origin main
 注意事项：
 - `config/api_keys.txt` 里的密钥会被上传，建议上传前改成示例值（如 `sk-yourkey`）或在 `.gitignore` 里排除
 - `config/custom_nodes.json` 里有你的节点配置信息，同样建议排除或清空再上传
+- `config/sub_urls.json` 里有你的订阅链接，如果包含私人 token 建议排除
 - `bin/xray` 是二进制文件，体积较大，可以加入 `.gitignore` 让其他人部署时自动下载
 
 建议的 `.gitignore`：
@@ -78,6 +116,7 @@ git push -u origin main
 bin/xray
 config/api_keys.txt
 config/custom_nodes.json
+config/sub_urls.json
 logs/
 __pycache__/
 *.pyc
@@ -120,7 +159,7 @@ __pycache__/
 
 | 参数名 | 说明 | Gemini 对应 |
 |--------|------|-------------|
-| `temperature` | 随机性（0=固定，2=最发散）。调高会让回复更有创意/多样，调低更严谨/重复 | `temperature` |
+| `temperature` | 随机性（0=固定，2=最发散） | `temperature` |
 | `max_tokens` | 最大输出 token 数 | `maxOutputTokens` |
 | `top_p` | 核采样概率阈值 | `topP` |
 | `top_k` | 每步候选词数量 | `topK` |
@@ -129,50 +168,6 @@ __pycache__/
 | `response_format` | `{"type": "json_object"}` 时强制 JSON 输出 | `responseMimeType` |
 | `tools` / `functions` | Function Calling | `tools.functionDeclarations` |
 | `stream` | 是否流式输出 | — |
-
-> **关于 `temperature`**：值越高 AI 回复越随机、有创意，值越低越保守、严谨。一般聊天用 0.7~1.0，创意写作用 1.2~1.8，需要精确答案用 0.1~0.3。
-
----
-
-## 代理管理
-
-访问 `/proxy-manager` 打开管理界面，可以：
-
-- 查看当前节点状态和 xray 是否在运行
-- 切换订阅节点（当当前 IP 配额耗尽时换一个）
-- 添加自定义节点（支持 Clash YAML 格式、xray JSON 格式）
-- 查看最近的请求日志
-
-**当出现 429 配额耗尽时**：在管理界面切换到下一个节点，换一个 IP 继续用。
-
----
-
-## 配置文件说明
-
-### `config/config.json`
-
-```json
-{
-  "port_api": 2156,
-  "max_retries": 8,
-  "debug": false,
-  "log_dir": "logs"
-}
-```
-
-| 字段 | 说明 |
-|------|------|
-| `port_api` | API 服务端口（Replit 部署时被 PORT 环境变量覆盖，改这个没用） |
-| `max_retries` | 单次请求最多重试次数（遇到 401/403/429/空回复自动重试） |
-| `debug` | 改成 `true` 会输出详细的请求/响应日志，方便排错 |
-
-### `config/api_keys.txt`
-
-每行一个有效的 API 密钥。客户端在 Authorization 头里带上一样的值才能访问。
-
-### `config/models.json`
-
-可用的模型名称列表。如果 Google 新出了模型，在这里加上模型名即可。
 
 ---
 
@@ -190,12 +185,17 @@ __pycache__/
 | `POST /v1beta/models/{model}:generateContent` | Gemini 原生格式请求 |
 | `GET /proxy-manager` | 代理管理界面 |
 | `GET /proxy-manager/status` | 当前代理状态 JSON |
+| `GET /proxy-manager/sub-urls` | 订阅链接列表 |
+| `POST /proxy-manager/sub-urls` | 添加订阅链接 |
+| `DELETE /proxy-manager/sub-urls/{index}` | 删除订阅链接 |
+| `GET /proxy-manager/list` | 节点列表（加 `?refresh=true` 重新拉取） |
+| `POST /proxy-manager/bench` | 启动并发测速 |
+| `GET /proxy-manager/bench-status` | 测速进度 |
+| `GET /proxy-manager/ip-check` | 直连 IP vs 代理 IP 对比 |
 
 ---
 
 ## 已知问题 & 踩坑记录
-
-以下是开发过程中遇到的所有问题，供部署时参考：
 
 ### 1. 生产环境 404（没有注册 artifact.toml）
 
@@ -218,92 +218,95 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 ### 3. 生产环境每次重启没有代理节点
 
-**现象**：生产容器是无状态的，每次部署/重启都是全新环境，之前选好的节点不见了，所有请求直连 Google，很快被限速。  
-**解决**：在 `main.py` 启动时加了自动初始化逻辑——检测到没有活跃节点时，自动拉取订阅并选第一个可用节点。
+**现象**：生产容器是无状态的，每次部署/重启都是全新环境，之前选好的节点不见了。  
+**解决**：启动时自动初始化——从 `config/sub_urls.json` 读取订阅链接，拉取节点列表，选第一个可用节点。
 
 ---
 
 ### 4. SOCKS5 代理对 Vertex AI 端点无效（旧 CF 节点）
 
-**现象**：配置了 CF 系列代理节点，但 `cloudconsole-pa.clients6.google.com` 通过代理访问失败（ConnectError）。  
+**现象**：配置了 CF 系列代理节点，但 `cloudconsole-pa.clients6.google.com` 通过代理访问失败。  
 **原因**：部分 CF 优选节点只代理 Cloudflare 的 IP 段，Google 的 API 端点不在其中。  
-**解决**：代码加了自动降级——代理失败时直连，两条路都不通才报错。实测 CF 官方优选节点可以到达该端点（返回 404 或 401 是正常的认证流程，不代表不可达）。
+**解决**：代理失败时自动降级直连，两条路都不通才报错。
 
 ---
 
-### 5. 单 Replit IP 配额很快耗尽（429 Resource Exhausted）
+### 5. 单 IP 配额很快耗尽（429 Resource Exhausted）
 
-**现象**：连续发几次请求就报 `Resource has been exhausted`，隔一段时间又好了。  
+**现象**：连续发几次请求就报 `Resource has been exhausted`。  
 **原因**：Google 按 IP 限速，Replit 的 IP 是共享的，很容易触发。  
-**解决**：请求改为代理优先——走 xray SOCKS5 代理，用代理节点的 IP 发请求，每个节点有独立配额。遇到 429 自动切换到下一个节点重试，也可以在管理界面手动切换。
+**解决**：请求改为代理优先，遇到 429 自动切换下一个节点重试。
+
+> **关于 CF 节点的额外说明**：即使换了不同的 CF 节点，出口 IP 可能仍在 Cloudflare 的同一个 ASN 下，Google 可能会对整段 CF IP 集体限速。要真正换出口，需要添加非 CF 的节点（如你自己的 VPS、Shadowsocks 节点等）。
 
 ---
 
 ### 6. SillyTavern 流式输出内容被截断
 
 **现象**：SillyTavern 里 AI 回复不完整，有时直接空白。  
-**原因**：Gemini 的最后一个 SSE chunk 同时包含内容和 `finish_reason: stop`。SillyTavern 严格遵守 OpenAI 规范——看到 `finish_reason` 就停止读取，内容就丢了。  
-**解决**：在 `openai_compat.py` 里，当一个 chunk 同时含内容和 finish_reason 时，拆成两个 chunk 发送：第一个只含内容（finish_reason=null），第二个只含 finish_reason（delta 为空）。
+**原因**：Gemini 的最后一个 SSE chunk 同时包含内容和 `finish_reason: stop`。SillyTavern 看到 `finish_reason` 就停止读取，内容就丢了。  
+**解决**：把最后一个 chunk 拆成两个发送——第一个只含内容，第二个只含 finish_reason。
 
 ---
 
 ### 7. batchGraphql 接口本身不是真流式
 
-**现象**：配置了流式模式（`stream: true`），但 AI 回复还是等很长时间才一次性出现。  
-**原因**：服务底层调用的 `batchGraphql` 接口是"假流式"设计，Google 那边就是等全部内容生成完再一次性返回，无论客户端怎么设置。  
-**解决**：引入 `fs-` 前缀模型——底层照样是非流式拿数据，但拿到数据后把内容拆成每 3 个字符一组逐包发送，客户端看起来是逐字打印效果。
+**现象**：配置了 `stream: true`，但 AI 回复还是等很长时间才一次性出现。  
+**原因**：服务底层调用的 `batchGraphql` 接口等全部内容生成完再一次性返回。  
+**解决**：引入 `fs-` 前缀模型——拿到数据后拆成每 3 个字符一组逐包发送，客户端看起来是逐字打印效果。
 
 ---
 
 ### 8. httpx 不支持 SOCKS5（忘记装 socksio）
 
-**现象**：代码里用 `httpx.AsyncClient(proxy="socks5://...")` 但代理没生效，或者直接报错。  
-**原因**：httpx 需要额外安装 `socksio` 包才支持 SOCKS5 协议，否则直接忽略代理设置。  
+**现象**：用 `httpx.AsyncClient(proxy="socks5://...")` 但代理没生效。  
 **解决**：在 `requirements.txt` 里写 `httpx[socks]`（自动安装 socksio）。
 
 ---
 
 ### 9. MockSession 不支持异步上下文管理器
 
-**现象**：服务启动报错：  
-```
-'MockSession' object does not support the asynchronous context manager protocol
-```
-**原因**：`vertex_client.py` 调用了 `async with session: ...` 或 `await session.close()`，但 MockSession 类没有实现 `__aenter__`/`__aexit__`/`aclose` 方法。  
-**解决**：在 MockSession 上补全这些方法。
+**现象**：`'MockSession' object does not support the asynchronous context manager protocol`  
+**解决**：在 MockSession 上补全 `__aenter__`/`__aexit__`/`aclose` 方法。
 
 ---
 
 ### 10. Token 计数失败（不影响功能）
 
-**现象**：日志里偶尔出现：  
-```
-远程 Token 计数失败: 'MockSession' object does not support the asynchronous context manager protocol
-```
-**说明**：这是 Token 计数模块的问题，不影响 AI 请求正常响应。Usage 统计里的 token 数可能为 0，但实际请求和回复都是正常的。
+**现象**：日志里偶尔出现 MockSession 相关错误。  
+**说明**：Token 计数模块的问题，不影响 AI 请求正常响应。Usage 里 token 数可能为 0，但实际请求和回复都正常。
 
 ---
 
-### 11. Gemini 有时返回空回复（无任何文字内容）
+### 11. Gemini 有时返回空回复
 
 **现象**：AI 回复是空白消息，没有报错。  
-**原因**：Gemini 偶尔会返回结构完整但没有文字内容的响应（`candidates` 存在但 `parts` 里没有 `text`），服务之前会把它当正常完成发出去。  
-**解决**：现在每次拿到 Gemini 响应后，先检测里面有没有实际文字。如果是空回复，自动换下一个代理节点并重试，直到拿到有内容的回复再发给客户端。重试次数由 `config.json` 的 `max_retries` 控制。
+**原因**：Gemini 偶尔返回结构完整但没有文字内容的响应。  
+**解决**：检测到空回复后自动换节点重试，直到拿到有内容的回复。
 
 ---
 
 ### 12. SillyTavern 报 "error decoding response body"
 
-**现象**：使用流式模式时，SillyTavern 弹出错误：  
-```
-[API Error] Custom OpenAI stream read failed: error decoding response body
-```
-**原因有两个**：  
-① SillyTavern 发请求时带了 `Accept-Encoding: gzip`，Replit 的部署层中间代理看到这个头后可能对 SSE 流进行了 gzip 压缩。SillyTavern 读 SSE 流时用原始字节直接 decode，没有先解压，导致解码失败。  
-② Gemini 返回错误 chunk（如 429）时，原来的代码直接把这个 chunk 丢掉，客户端收到不完整的流，某些情况下触发解析异常。  
-**解决**：  
-① 响应头加了 `Content-Encoding: identity`，明确告诉所有中间代理"不要压缩，原样转发"。  
-② 上游错误 chunk 现在会被转换成 OpenAI 错误格式透传给客户端，不再静默丢弃。
+**现象**：使用流式模式时 SillyTavern 弹出该错误。  
+**原因**：① Replit 中间代理对 SSE 流做了 gzip 压缩；② Gemini 错误 chunk 被静默丢弃导致流不完整。  
+**解决**：① 响应头加 `Content-Encoding: identity` 禁止中间层压缩；② 上游错误 chunk 转换成 OpenAI 错误格式透传。
+
+---
+
+### 13. 新订阅链接拉取成功但节点没更新（明文格式问题）
+
+**现象**：添加了明文 vless/vmess 订阅链接（内容直接是 `vmess://...` 一行一行），刷新后节点数量没变化或报"解析出 0 个节点"。  
+**原因**：旧代码看到内容先做 base64 解码，把已经是明文的 `vmess://` 链接当成 base64 字符串处理，解码后变成乱码，一个节点都认不出来。  
+**解决**：现在先检测内容里有没有 `vless://` 或 `vmess://` 开头的行，有就直接按明文解析，不做 base64 解码。同时解析失败时会明确报错，显示内容预览，不再静默使用旧缓存。
+
+---
+
+### 14. 所有 CF 节点测速延迟相同
+
+**现象**：点"一键测速排序"后，订阅里所有节点显示完全相同的延迟（如全部 29ms）。  
+**原因**：测速用的是 TCP ping（连接 server:port 测握手时间）。Cloudflare 使用任播网络，无论打哪个 CF IP，TCP 连接都会被路由到距离 Replit 最近的同一个 CF 机房，所以测出来延迟相同。这是网络特性，不是代码 bug。  
+**说明**：TCP ping 对 CF 节点的实际作用是检测哪些节点完全不可达（超时），而不是区分各节点性能。要获得有意义的节点间性能差异，需要添加来自不同运营商/地区的非 CF 节点。
 
 ---
 
@@ -319,19 +322,54 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
               openai → gemini 格式转换
                         ↓
               获取 Recaptcha Token
-              （primp 伪装 Chrome TLS 指纹）
+              （primp 伪装 Chrome TLS 指纹，直连优先）
                         ↓
               发送到 cloudconsole-pa.clients6.google.com
               优先走 xray SOCKS5 代理（换 IP）
               失败则直连降级
                         ↓
-              检测响应内容：空回复 → 换节点重试
+              检测响应：空回复 → 换节点重试
               有内容 → gemini 格式转换为 openai 格式
               拆分最后一个 chunk（SillyTavern 兼容）
               响应头加 Content-Encoding: identity（防压缩）
                         ↓
               SSE 流式返回给客户端
 ```
+
+---
+
+## 配置文件说明
+
+### `config/config.json`
+
+| 字段 | 说明 |
+|------|------|
+| `port_api` | API 服务端口（Replit 部署时被 PORT 环境变量覆盖） |
+| `max_retries` | 单次请求最多重试次数（遇到 401/403/429/空回复自动重试） |
+| `debug` | 改成 `true` 会输出详细的请求/响应日志 |
+
+### `config/api_keys.txt`
+
+每行一个有效的 API 密钥。客户端在 Authorization 头里带上一样的值才能访问。
+
+### `config/sub_urls.json`
+
+订阅链接列表，通过管理界面添加/删除，也可以直接编辑这个文件：
+
+```json
+[
+  "https://example.com/sub?token=xxx",
+  "https://raw.githubusercontent.com/xxx/sub.txt"
+]
+```
+
+### `config/custom_nodes.json`
+
+自定义节点列表，通过管理界面添加，支持 vless://、vmess:// 或完整 xray JSON。
+
+### `config/models.json`
+
+可用的模型名称列表。如果 Google 新出了模型，在这里加上模型名即可。
 
 ---
 
@@ -352,22 +390,25 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 ## 常见问题
 
 **Q：为什么有时会报 429？**  
-A：单个 IP 的配额用完了。服务会自动换节点重试。如果还是失败，去管理界面 `/proxy-manager` 手动切换到下一个节点。
+A：单个 IP 的配额用完了。服务会自动换节点重试。如果还是失败，去管理界面 `/proxy-manager` 手动切换节点，或点"一键测速排序"选最优节点。
+
+**Q：为什么所有节点测速延迟一样？**  
+A：你的订阅全是 CF 节点，见上方第 14 条已知问题。解决方法是添加非 CF 的节点。
 
 **Q：为什么服务刚启动时第一次请求比较慢？**  
-A：启动后大约 4 秒才完成订阅拉取和节点选择。这段时间内的请求会走直连，速度正常，只是配额用的是 Replit IP。
+A：启动后大约 4 秒才完成订阅拉取和节点选择。这段时间内的请求会走直连。
 
 **Q：为什么回复前要等一段时间，然后文字一下子全出来？**  
-A：底层接口（batchGraphql）本身不支持真流式，Gemini 生成完全部内容才返回。如果想要逐字打印效果，换用 `fs-` 前缀的模型（如 `fs-gemini-2.5-flash`）。
+A：底层接口（batchGraphql）本身不支持真流式。如果想要逐字打印效果，换用 `fs-` 前缀的模型（如 `fs-gemini-2.5-flash`）。
 
 **Q：能不能同时用多个 Google 账号？**  
 A：目前没有多账号轮换，所有请求用同一个控制台接口（匿名 Recaptcha Token）。
-
-**Q：为什么日志里有 token 计数失败？**  
-A：不影响使用，忽略即可。
 
 **Q：xray 二进制是从哪来的？**  
 A：启动时自动检测 `bin/xray`，如果不存在会自动下载。
 
 **Q：SillyTavern 报 "error decoding response body" 怎么办？**  
-A：已在服务端修复（加了 `Content-Encoding: identity` 头）。如果还出现，检查 SillyTavern 连接的是不是最新发布的地址，而不是旧的缓存地址。
+A：已在服务端修复。如果还出现，检查连接的是不是最新发布的地址。
+
+**Q：添加了新订阅链接但节点没变化？**  
+A：添加链接后需要点"刷新节点列表"按钮才会重新拉取。刷新后会显示每条链接的拉取结果（✅/❌），如果某条链接有问题会直接显示原因。
