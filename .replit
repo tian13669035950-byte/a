@@ -3,6 +3,7 @@ modules = ["nodejs-24", "python-3.11"]
 [deployment]
 router = "application"
 deploymentTarget = "autoscale"
+run = ["sh", "-c", "cd vertex-proxy && python3 main.py"]
 
 [deployment.postBuild]
 args = ["pnpm", "store", "prune"]
