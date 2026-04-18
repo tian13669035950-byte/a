@@ -72,7 +72,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         logger.debug(f"收到请求: {method} {path} from {client_ip}")
 
-        if self.excluded_paths and path in self.excluded_paths:
+        if self.excluded_paths and any(path == ep or path.startswith(ep + "/") for ep in self.excluded_paths):
             logger.debug(f"路径 {path} 在排除列表中，跳过认证")
             return await call_next(request)
 
