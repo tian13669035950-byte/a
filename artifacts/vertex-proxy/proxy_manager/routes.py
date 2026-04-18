@@ -265,20 +265,36 @@ async def ui():
 @router.get("/list")
 async def list_nodes(refresh: bool = False):
     global _cached_nodes
+    fetch_results: list[dict] = []  # per-url result info
+
     if refresh:
-        # 手动刷新：从所有订阅 URL 拉取，合并去重
         urls = _load_sub_urls()
+        if not urls:
+            return JSONResponse({"error": "没有订阅链接，请先在「订阅链接管理」里添加链接", "nodes": [], "fetch_results": []}, status_code=400)
+
         raw_nodes = []
-        errors = []
         for url in urls:
+            short = url[:60] + "…" if len(url) > 60 else url
             try:
-                raw_nodes.extend(fetch_and_parse(url))
+                fetched = fetch_and_parse(url)
+                raw_nodes.extend(fetched)
+                fetch_results.append({"url": short, "ok": True, "count": len(fetched)})
             except Exception as e:
-                errors.append(str(e))
+                fetch_results.append({"url": short, "ok": False, "error": str(e)})
+
+        all_failed = all(not r["ok"] for r in fetch_results)
         if not raw_nodes:
-            if not _cached_nodes:
-                return JSONResponse({"error": "; ".join(errors) or "无订阅链接", "nodes": []}, status_code=502)
-            raw_nodes = _cached_nodes
+            # 全部失败，如果有旧缓存就回退并附带错误信息
+            if _cached_nodes:
+                safe = [{k: v for k, v in n.items() if k != "raw"} for n in _cached_nodes]
+                return JSONResponse({
+                    "nodes": safe, "total": len(safe), "from_cache": True,
+                    "detecting": _detect_status["running"],
+                    "fetch_results": fetch_results,
+                    "warning": "所有订阅链接拉取/解析失败，当前显示的是上次缓存的旧节点"
+                })
+            errors_str = " | ".join(r.get("error", "") for r in fetch_results if not r["ok"])
+            return JSONResponse({"error": errors_str or "未能解析到任何节点", "nodes": [], "fetch_results": fetch_results}, status_code=502)
 
         # 合并已有 country/colo/latency_ms 数据
         old_map = {n.get("server"): n for n in _cached_nodes}
@@ -310,12 +326,16 @@ async def list_nodes(refresh: bool = False):
             urls = _load_sub_urls()
             raw_nodes = []
             for url in urls:
+                short = url[:60] + "…" if len(url) > 60 else url
                 try:
-                    raw_nodes.extend(fetch_and_parse(url))
-                except Exception:
-                    pass
+                    fetched = fetch_and_parse(url)
+                    raw_nodes.extend(fetched)
+                    fetch_results.append({"url": short, "ok": True, "count": len(fetched)})
+                except Exception as e:
+                    fetch_results.append({"url": short, "ok": False, "error": str(e)})
             if not raw_nodes:
-                return JSONResponse({"error": "拉取订阅失败，请检查订阅链接", "nodes": []}, status_code=502)
+                errors_str = " | ".join(r.get("error", "") for r in fetch_results if not r["ok"])
+                return JSONResponse({"error": errors_str or "拉取订阅失败，请检查订阅链接", "nodes": [], "fetch_results": fetch_results}, status_code=502)
             _cached_nodes = raw_nodes
             _save_nodes_to_disk(_cached_nodes)
             proxy_state.set_nodes(_cached_nodes)
@@ -325,7 +345,7 @@ async def list_nodes(refresh: bool = False):
 
     safe = [{k: v for k, v in n.items() if k != "raw"} for n in _cached_nodes]
     return {"nodes": safe, "total": len(safe), "from_cache": not refresh,
-            "detecting": _detect_status["running"]}
+            "fetch_results": fetch_results, "detecting": _detect_status["running"]}
 
 
 @router.get("/detect-status")
@@ -1098,11 +1118,29 @@ async function loadNodes(refresh = false) {
   if (refresh) document.getElementById('table-container').innerHTML = '<span class="loading">正在拉取订阅…</span>';
   try {
     const d = await api('/list' + (refresh ? '?refresh=true' : ''));
-    if (d.error) { showAlert('拉取失败: ' + d.error); return; }
-    nodes = d.nodes;
+
+    // 显示每条链接的拉取结果
+    if (refresh && d.fetch_results && d.fetch_results.length) {
+      const parts = d.fetch_results.map(r =>
+        r.ok
+          ? `✅ ${escHtml(r.url)} → ${r.count} 个节点`
+          : `❌ ${escHtml(r.url)} → ${escHtml(r.error || '失败')}`
+      ).join('<br>');
+      const box = document.getElementById('alert-box');
+      box.className = 'alert ' + (d.fetch_results.every(r => r.ok) ? 'alert-success' : 'alert-error');
+      box.innerHTML = parts;
+      box.style.display = 'block';
+      // 有警告单独显示
+      if (d.warning) {
+        box.innerHTML = `⚠️ ${escHtml(d.warning)}<br><small style="color:#94a3b8">${parts}</small>`;
+        box.className = 'alert alert-error';
+      }
+    }
+
+    if (d.error && !d.nodes?.length) { showAlert('拉取失败: ' + d.error); return; }
+    nodes = d.nodes || [];
     document.getElementById('node-count').textContent = `共 ${d.total} 个节点`;
     renderTable();
-    // 如果正在检测，启动轮询
     if (d.detecting && !detectPollTimer) {
       document.getElementById('detect-status').style.display = 'inline';
       document.getElementById('detect-status').style.color = '#f59e0b';

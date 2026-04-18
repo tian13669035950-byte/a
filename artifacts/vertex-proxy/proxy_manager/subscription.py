@@ -156,12 +156,22 @@ def fetch_and_parse(sub_url: str) -> list[dict[str, Any]]:
     if is_clash:
         return _parse_clash_yaml(raw)
 
-    # 尝试 base64 解码后按行解析 vless/vmess
-    try:
-        decoded = _safe_b64decode(raw).decode("utf-8", errors="ignore")
-        lines = decoded.strip().splitlines()
-    except Exception:
-        lines = raw.strip().splitlines()
+    # 先检查原始内容是否直接包含 vless/vmess 链接（明文格式）
+    raw_lines = raw.strip().splitlines()
+    has_plain_links = any(
+        l.strip().startswith("vless://") or l.strip().startswith("vmess://")
+        for l in raw_lines[:50]
+    )
+
+    if has_plain_links:
+        lines = raw_lines
+    else:
+        # 尝试 base64 解码
+        try:
+            decoded = _safe_b64decode(raw).decode("utf-8", errors="ignore")
+            lines = decoded.strip().splitlines()
+        except Exception:
+            lines = raw_lines
 
     nodes: list[dict[str, Any]] = []
     for line in lines:
@@ -174,5 +184,13 @@ def fetch_and_parse(sub_url: str) -> list[dict[str, Any]]:
             node = parse_vmess(line)
             if node:
                 nodes.append(node)
+
+    if not nodes:
+        preview = raw[:120].replace("\n", " ").replace("\r", "")
+        raise RuntimeError(
+            f"订阅内容解析出 0 个节点（共 {len(raw)} 字节）。"
+            f"目前只支持 vless://、vmess:// 和 Clash YAML 格式。"
+            f"内容预览：{preview!r}"
+        )
 
     return nodes
