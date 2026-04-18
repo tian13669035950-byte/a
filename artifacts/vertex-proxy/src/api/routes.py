@@ -52,8 +52,7 @@ async def with_sse_heartbeat(
             await queue.put(SENTINEL)
 
     task = asyncio.create_task(producer())
-    # 立刻发一个心跳，让客户端知道连接已建立
-    yield ": connected\n\n"
+    # 注：不发首个心跳注释。某些挑剔的 SSE 客户端遇到非 data: 开头会出错
     try:
         while True:
             try:
@@ -325,6 +324,12 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         fake_stream = isinstance(raw_model, str) and raw_model.startswith("fs-")
         if fake_stream:
             body = {**body, "model": raw_model[3:]}  # 去掉 fs- 再传给 Gemini
+        else:
+            # 即使没显式开 fs-，流式请求也强制逐字输出。
+            # 因为内部已缓冲整段响应（用于空回复检测），上游一次返回的大块
+            # 不拆分会让某些聊天客户端误判为"提前结束"或渲染空白。
+            if is_stream:
+                fake_stream = True
 
         model, gemini_payload = openai_request_to_gemini(body)
 
