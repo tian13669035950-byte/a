@@ -245,14 +245,7 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
                 error = InternalError(message=str(e))
                 yield error.to_sse()
 
-        return StreamingResponse(
-            with_sse_heartbeat(stream_generator()),
-            media_type="text/event-stream; charset=utf-8",
-            headers={
-                "Cache-Control": "no-cache",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        return StreamingResponse(stream_generator(), media_type="application/json")
     app.post("/v1beta/models/{model}:streamGenerateContent", response_model=None)(stream_generate_content)
 
     async def generate_content(model: str, request: Request) -> JSONResponse | dict[str, Any]:
@@ -324,12 +317,6 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         fake_stream = isinstance(raw_model, str) and raw_model.startswith("fs-")
         if fake_stream:
             body = {**body, "model": raw_model[3:]}  # 去掉 fs- 再传给 Gemini
-        else:
-            # 即使没显式开 fs-，流式请求也强制逐字输出。
-            # 因为内部已缓冲整段响应（用于空回复检测），上游一次返回的大块
-            # 不拆分会让某些聊天客户端误判为"提前结束"或渲染空白。
-            if is_stream:
-                fake_stream = True
 
         model, gemini_payload = openai_request_to_gemini(body)
 
@@ -363,7 +350,7 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(
-                with_sse_heartbeat(openai_stream()),
+                openai_stream(),
                 media_type="text/event-stream; charset=utf-8",
                 headers={
                     "Cache-Control": "no-cache",
