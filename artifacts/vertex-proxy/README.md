@@ -312,15 +312,44 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 ---
 
-### 14. 回复内容被截断（响应流被中途切断）
+### 14. 回复内容被截断（parser parts 覆盖 bug）
 
-**现象**：AI 回复说到一半突然停了，文本看起来语句不完整（"…然后你可以，"再无下文）。  
-**原因**：上游 batchGraphql 的 HTTP 流被中途切断（代理节点抖动 / Google 提前关闭连接 / 网络异常），但代码把残缺的 buffer 当成完整响应处理——里面有部分文字，于是直接发给客户端，看起来就像"截断"。  
-**判定方法**：完整的 Gemini 响应**必有 `finishReason`**（STOP / MAX_TOKENS / SAFETY 等）。如果响应里没有任何 `finishReason`，就是流被切断了。  
-**解决**：buffer 收完后双重判定——
-- 没文字 → 空回复，换节点重试
-- **有文字但没 finishReason → 截断响应，换节点重试**
-- 重试耗尽仍然不完整 → 原样发出并在日志里记录
+**现象**：AI 回复说到一半突然停了，比如"我是由谷歌训练的旅行。语言模型你可以，"然后什么都没了。  
+**原因**：batchGraphql 响应的某个 streaming chunk（path index）可能携带多个 `parts`（比如内容分多块返回，或者同时有思考块+内容块）。旧代码用 `dict[path_index] = part` 赋值，后面的 part 会覆盖前面的，丢失了中间的内容。  
+**解决**：改为 `dict[path_index]` 存列表，所有 parts 都追加进去，最后按顺序拼接，不再丢失任何块。  
+**⚠️ 不要再"优化"成 dict 覆盖**：表面上看 `state['parts_by_path'][path_index] = part` 更简洁，注释里写"后到的是完整态"也很容易让人信，但实际上 batchGraphql 同一 path_index 后到的 part 是**增量片段**而不是完整覆盖。一旦改成赋值，立刻退化成空回复或截断输出。
+
+---
+
+### 16. 给 OpenAI-compat SSE 流加心跳会破坏 SillyTavern 解析
+
+**现象**：为了防止"首字节超时"在 SSE 流里每隔几秒发一行 `: ping\n\n` 注释，结果 SillyTavern 直接停止显示输出。  
+**原因**：SSE 规范虽然允许注释行，但部分挑剔的客户端对非 `data:` 开头的行处理有 bug。Gemini 的真流式间隔本来就够短，根本不需要心跳。  
+**结论**：**不要给 `/v1/chat/completions` 流加心跳包装器**。如果客户端真的因为长等待断开，应该让客户端调超时，不是在协议层塞心跳。
+
+---
+
+### 17. 强制 `fake_stream=True` 会让客户端"看起来卡死"
+
+**现象**：为了"统一体验"把所有流式请求强制走假流式（buffered + 拆字节模拟流），结果用户反馈"输出不动了"。  
+**原因**：假流式必须等 buffer 收齐才开始拆包发送，对于慢模型（pro / 3.x preview）首字节延迟可能 30~60 秒，期间客户端完全收不到任何字节。真流式虽然底层 batchGraphql 也是 buffer 的，但 Gemini 自身分块返回会让首字节更早到达。  
+**结论**：**不要全局强制 `fake_stream`**。这个开关只在客户端明确选了 `fs-` 前缀模型时才启用。
+
+---
+
+### 18. "代理全失败兜底走直连" 看似稳健，实际违背设计目的
+
+**现象**：在 vertex_client 里加 `force_direct_var` ContextVar，所有代理节点都试过仍失败时，最后一次重试改走 Replit 直连。  
+**问题**：这个项目用代理本来就是为了**保护 Replit IP 配额**——免费 Replit IP 是共享的，被 Google 标记一次后所有共用 IP 的人都受影响。"兜底直连"为了一次成功而消耗 Replit 全局配额，赢了一局输了战略。  
+**结论**：**代理全部失败应该明确报错给客户端**，让用户去 `/proxy-manager` 刷新订阅或加新节点。不要悄悄降级直连。
+
+---
+
+### 19. UI 轮询日志刷屏（已修复）
+
+**现象**：打开 `/proxy-manager` 网页后，日志窗口被 `/proxy-manager/status`、`/proxy-manager/logs`、`/proxy-manager/ip-check` 这三个轮询接口的访问行刷满，多开几个标签页更严重。  
+**原因**：管理界面前端每 8 秒拉 status、每 15 秒拉 logs，用 uvicorn 默认 access 日志会无差别打印。  
+**解决**：在 logger 里加了 `_NoiseFilter`，对这三个路径的访问日志静默处理（请求功能照常工作，只是不打日志）。
 
 ---
 
@@ -392,6 +421,45 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 ### `config/models.json`
 
 可用的模型名称列表。如果 Google 新出了模型，在这里加上模型名即可。
+
+---
+
+## 环境变量（部署时推荐）
+
+在 Replit Secrets 里设置以下变量可以覆盖默认行为，**不要把生产值写进配置文件再 push 到 GitHub**。
+
+| 变量名 | 作用 | 不设置时 |
+|--------|------|---------|
+| `API_KEY` | 客户端访问密钥（自动补 `sk-` 前缀） | 用 `config/api_keys.txt` 里的 `sk-123456`，并在启动日志里打警告 |
+| `ADMIN_PASSWORD` | `/proxy-manager` 管理界面 HTTP Basic 密码 | 不启用密码校验，任何人都能访问管理页 |
+| `SUB_URL` | 默认订阅链接（覆盖代码内置那条） | 用代码里硬编码的内置订阅 |
+| `PORT` | API 监听端口（Replit 部署自动注入） | 走 `config/config.json` 的 `port_api` |
+
+---
+
+## 启动行为补充
+
+- **节点磁盘缓存**：上次成功使用的节点列表存在 `config/cached_nodes.json`，重启时优先读它（冷启动跳过订阅拉取，几乎瞬间就绪）。缓存为空才会去拉订阅。
+- **多源订阅 fallback**：拉订阅时先按 `config/sub_urls.json` 顺序尝试，全部失败才回退到代码内置 `SUB_URL`，每条失败原因都进日志。
+- **xray 并发锁**：`proxy_state` 里有 `_xray_lock`，防止主请求和节点扫描同时重启 xray 杀掉对方连接。
+- **扫描期 rotate 节流**：管理界面在跑"检测可用节点"时，主请求遇到 429 不会再触发节点切换，避免抢 xray。
+
+---
+
+## 改动禁区（写给改这个项目的人）
+
+这个项目反复被"看着合理"的改动搞坏过。下面这些是**血泪教训**，改之前请先读对应的"已知问题"条目：
+
+| 不要做 | 为什么 | 见 |
+|--------|-------|-----|
+| 把 `parser.py` 的 `parts_by_path` 从 list 改回 dict 覆盖 | 同一 path_index 后到的 part 是增量片段，不是完整态。改成赋值会立刻退化成空回复/截断 | 第 14 条 |
+| 给 `/v1/chat/completions` SSE 流加心跳（`: ping\n\n`）| SillyTavern 等客户端遇到非 `data:` 行会异常，输出停止 | 第 16 条 |
+| 全局强制 `fake_stream=True` | 慢模型会让客户端首字节等 30~60 秒，看起来卡死 | 第 17 条 |
+| 加"代理全失败兜底走直连"的 ContextVar | 违背项目用代理保护 Replit IP 的初衷；应该明确报错让用户换节点 | 第 18 条 |
+| 给 vertex 响应加"无 finishReason 就当截断重试"的判定 | 部分模型/部分调用确实会出现末包没有 finishReason 的合法响应，会触发不必要的重试，浪费配额 | 历史 |
+| 直接编辑 `artifact.toml` / `.replit` | 应该用平台提供的工件管理工具改 | — |
+
+**遇到 bug 优先去查"已知问题"列表（共 19 条）。如果要新增逻辑，请先确认 README 里没写过这条已经被否决的方案。**
 
 ---
 
