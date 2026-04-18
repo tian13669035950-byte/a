@@ -111,10 +111,8 @@ DEFAULT_COUNTRY_PRIORITY = ["JP", "KR", "AU", "SG", "HK", "TW", "NZ", "GB", "DE"
 
 def detect_one(server_ip: str, timeout: int = 6) -> dict:
     """
-    连接 CF /cdn-cgi/trace 获取节点真实出口数据中心和国家。
-    注意：此函数测的是直连 CF IP 看到的出口（即 Replit 自身出口，
-    用作粗略地理标记，并非真正经过节点的出口）。真实经过节点的
-    出口需要通过 SOCKS5，但这里仅作展示用，不影响 alive 判定。
+    连接 CF IP 的 /cdn-cgi/trace（HTTP）获取数据中心代码和国家。
+    返回 {"colo": "NRT", "country": "JP", "exit_ip": "...", "loc": "JP"}
     """
     try:
         req = urllib.request.Request(

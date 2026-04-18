@@ -1,10 +1,9 @@
 """FastAPI路由模块"""
 
-import asyncio
 import json
 import time
 import uuid
-from typing import Any, AsyncGenerator, cast
+from typing import Any, cast
 import collections.abc
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
@@ -28,50 +27,6 @@ from src.core.auth import api_key_manager
 from src.utils.logger import get_logger, set_request_id
 
 logger = get_logger(__name__)
-
-
-async def with_sse_heartbeat(
-    source: AsyncGenerator[str, None],
-    interval: float = 3.0,
-) -> AsyncGenerator[str, None]:
-    """
-    给 SSE 流加心跳：上游每隔 interval 秒没数据就发一行 SSE 注释（": ping\\n\\n"），
-    防止聊天客户端因首字节超时而主动断开连接。
-    SSE 注释行会被任何符合规范的客户端忽略，但 TCP 连接保持活跃。
-    """
-    queue: asyncio.Queue = asyncio.Queue()
-    SENTINEL = object()
-
-    async def producer() -> None:
-        try:
-            async for chunk in source:
-                await queue.put(chunk)
-        except Exception as e:
-            await queue.put(("__error__", e))
-        finally:
-            await queue.put(SENTINEL)
-
-    task = asyncio.create_task(producer())
-    # 注：不发首个心跳注释。某些挑剔的 SSE 客户端遇到非 data: 开头会出错
-    try:
-        while True:
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=interval)
-            except asyncio.TimeoutError:
-                yield ": ping\n\n"
-                continue
-            if item is SENTINEL:
-                return
-            if isinstance(item, tuple) and item and item[0] == "__error__":
-                raise item[1]
-            yield item
-    finally:
-        if not task.done():
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
 
 
 def extract_api_key_from_request(request: Request) -> str | None:
@@ -117,7 +72,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         logger.debug(f"收到请求: {method} {path} from {client_ip}")
 
-        if self.excluded_paths and any(path == ep or path.startswith(ep + "/") for ep in self.excluded_paths):
+        if self.excluded_paths and path in self.excluded_paths:
             logger.debug(f"路径 {path} 在排除列表中，跳过认证")
             return await call_next(request)
 
@@ -368,24 +323,6 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
             return JSONResponse(content=openai_resp)
 
     app.post("/v1/chat/completions", response_model=None)(openai_chat_completions)
-
-    # 探活：部分 OpenAI 兼容客户端会 GET /v1/chat/completions 当健康检查
-    # 官方接口返 405 会被这些客户端误判成"端点失效"，所以改成返回 200 OK
-    async def chat_completions_probe() -> dict[str, Any]:
-        return {
-            "object": "endpoint",
-            "status": "ok",
-            "message": "OpenAI-compatible chat completions endpoint. Send a POST request to use it.",
-            "methods": ["POST"],
-        }
-    app.get("/v1/chat/completions")(chat_completions_probe)
-    app.head("/v1/chat/completions")(chat_completions_probe)
-
-    # Gemini 端点同理
-    async def gemini_probe(model: str) -> dict[str, Any]:
-        return {"object": "endpoint", "status": "ok", "model": model, "methods": ["POST"]}
-    app.get("/v1beta/models/{model}:generateContent")(gemini_probe)
-    app.get("/v1beta/models/{model}:streamGenerateContent")(gemini_probe)
 
     logger.info("FastAPI 应用创建完成")
     return app

@@ -25,7 +25,7 @@ async def _auto_init_proxy() -> None:
     """
     import time
     from proxy_manager import proxy_state
-    from proxy_manager.routes import SUB_URL, _load_sub_urls, _load_nodes_from_disk
+    from proxy_manager.routes import SUB_URL
     from proxy_manager.subscription import fetch_and_parse
     from proxy_manager.xray_manager import start_xray, ensure_xray
 
@@ -36,32 +36,20 @@ async def _auto_init_proxy() -> None:
 
     logger.info("未检测到活跃代理，开始自动初始化...")
 
-    # 确保 xray 二进制存在（首次启动会自动下载）
+    # 确保 xray 二进制存在
     try:
         ensure_xray()
     except Exception as e:
         logger.warning(f"xray 二进制检查失败: {e}")
 
-    # 优先使用磁盘缓存的节点（冷启动加速）
-    nodes = _load_nodes_from_disk()
-    if nodes:
-        logger.info(f"使用磁盘缓存的节点列表，共 {len(nodes)} 个")
-    else:
-        # 缓存为空：依次尝试用户自定义订阅 → 内置订阅
-        candidate_urls = _load_sub_urls() or []
-        if SUB_URL and SUB_URL not in candidate_urls:
-            candidate_urls.append(SUB_URL)
-
-        for url in candidate_urls:
-            try:
-                logger.info(f"正在拉取订阅: {url[:60]}...")
-                nodes = await asyncio.to_thread(fetch_and_parse, url)
-                if nodes:
-                    logger.info(f"订阅拉取成功，共 {len(nodes)} 个节点")
-                    break
-            except Exception as e:
-                logger.warning(f"订阅拉取失败 ({url[:40]}...): {e}")
-                continue
+    # 拉取订阅节点
+    try:
+        logger.info(f"正在拉取订阅节点...")
+        nodes = await asyncio.to_thread(fetch_and_parse, SUB_URL)
+        logger.info(f"订阅拉取成功，共 {len(nodes)} 个节点")
+    except Exception as e:
+        logger.error(f"拉取订阅失败: {e}")
+        return
 
     if not nodes:
         logger.error("订阅中没有可用节点")

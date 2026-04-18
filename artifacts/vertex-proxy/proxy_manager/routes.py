@@ -12,29 +12,9 @@ from .xray_manager import start_xray, start_xray_from_outbounds, stop_xray, is_r
 from . import proxy_state
 from .country_detect import detect_all, sort_nodes_by_priority, DEFAULT_COUNTRY_PRIORITY, COUNTRY_NAMES
 
-import secrets as _secrets
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+router = APIRouter(prefix="/proxy-manager", tags=["proxy-manager"])
 
-_admin_security = HTTPBasic(auto_error=False)
-
-def _admin_auth(creds: HTTPBasicCredentials | None = Depends(_admin_security)):
-    """管理界面访问控制：设置 ADMIN_PASSWORD 环境变量后启用 HTTP Basic 认证"""
-    expected = os.environ.get("ADMIN_PASSWORD", "").strip()
-    if not expected:
-        # 未设置密码：放行（开发环境）
-        return
-    if creds is None or not _secrets.compare_digest(creds.password, expected):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="需要管理员密码",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-router = APIRouter(prefix="/proxy-manager", tags=["proxy-manager"], dependencies=[Depends(_admin_auth)])
-
-_DEFAULT_SUB_URL = "https://tian110110.us.ci/sub?token=e2fb1e6322ce2a3d02e0d28de5846ea6"
-SUB_URL = os.environ.get("SUB_URL", "").strip() or _DEFAULT_SUB_URL
+SUB_URL = "https://tian110110.us.ci/sub?token=e2fb1e6322ce2a3d02e0d28de5846ea6"
 _cached_nodes: list = []
 _detect_status: dict = {"running": False, "done": 0, "total": 0, "last_run": ""}
 
@@ -633,58 +613,27 @@ async def quota_scan(request: Request):
     _quota_current = -1
     nodes_snap = list(_cached_nodes[:nodes_to_check])
 
-    # 标记扫描中，禁止主请求触发 rotate（防止抢 xray 杀掉扫描连接）
-    from .proxy_state import set_scanning
-    set_scanning(True)
-
-    # 轮流用这两个模型检测真实 Gemini 配额（不只是连通性）
-    SCAN_MODELS = ["gemini-2.5-pro", "gemini-3.1-pro-preview"]
-
-    def _check_node_sync(node: dict, model_name: str, timeout: float = 75.0) -> str:
-        """同步：启动 xray，调本地 /v1/chat/completions 用真实 Gemini 模型试一句话"""
+    def _check_node_sync(node: dict, timeout: float = 7.0) -> str:
+        """同步：启动 xray，用 httpx SOCKS5 打 google/generate_204 检测"""
         try:
-            ok, _msg = start_xray(node)
+            ok, msg = start_xray(node)
             if not ok:
                 return "dead"
-            # xray 内部已 _wait_socks5_ready，无需额外等待
+            time.sleep(0.5)  # xray 内部已 sleep(1.5)，再稍等让端口就绪
             try:
                 import httpx
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                    "max_tokens": 8,
-                }
-                headers = {
-                    "Authorization": "Bearer sk-123456",
-                    "Content-Type": "application/json",
-                }
-                with httpx.Client(timeout=timeout) as client:
-                    r = client.post(
-                        "http://127.0.0.1:8000/v1/chat/completions",
-                        json=payload,
-                        headers=headers,
-                    )
+                with httpx.Client(
+                    proxy="socks5://127.0.0.1:1080",
+                    timeout=timeout,
+                    follow_redirects=False,
+                ) as client:
+                    r = client.get("https://www.google.com/generate_204")
                     if r.status_code == 429:
                         return "exhausted"
-                    if r.status_code != 200:
-                        return "dead"
-                    try:
-                        body = r.json()
-                    except Exception:
-                        return "dead"
-                    # 检查是否真的有内容返回
-                    choices = body.get("choices") or []
-                    if not choices:
-                        return "dead"
-                    msg = (choices[0] or {}).get("message") or {}
-                    content = (msg.get("content") or "").strip()
-                    if content:
+                    elif r.status_code in (204, 200, 301, 302):
                         return "ok"
-                    # 有 200 但空内容 → 节点能连但模型没出结果，视为耗尽
-                    return "exhausted"
-            except httpx.TimeoutException:
-                return "dead"
+                    else:
+                        return "dead"
             except Exception:
                 return "dead"
         except Exception:
@@ -692,17 +641,14 @@ async def quota_scan(request: Request):
 
     async def _run():
         global _quota_running, _quota_results, _quota_current, _cached_nodes
-        from .proxy_state import set_scanning as _set_scanning
         try:
             loop = asyncio.get_event_loop()
             for i, node in enumerate(nodes_snap):
                 _quota_current = i
                 _quota_results[i] = "checking"
-                model_name = SCAN_MODELS[i % len(SCAN_MODELS)]
-                status = await loop.run_in_executor(None, _check_node_sync, node, model_name)
+                status = await loop.run_in_executor(None, _check_node_sync, node)
                 _quota_results[i] = status
         finally:
-            _set_scanning(False)
             _quota_current = -1
             _quota_running = False
             # 扫完后自动切回第一个 "ok" 节点

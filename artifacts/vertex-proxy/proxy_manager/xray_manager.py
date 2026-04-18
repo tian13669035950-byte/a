@@ -62,20 +62,6 @@ def ensure_xray() -> bool:
     return False
 
 
-
-def _wait_socks5_ready(host: str = "127.0.0.1", port: int = 1080, timeout: float = 5.0) -> bool:
-    """轮询等待 socks5 端口可连接，最多等 timeout 秒"""
-    import socket as _sock
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with _sock.create_connection((host, port), timeout=0.5):
-                return True
-        except OSError:
-            time.sleep(0.1)
-    return False
-
-
 def _build_vless_outbound(node: dict[str, Any]) -> dict[str, Any]:
     stream: dict[str, Any] = {"network": node.get("network", "tcp")}
     security = node.get("security", "none")
@@ -221,13 +207,11 @@ def start_xray_from_outbounds(outbounds: list[dict[str, Any]]) -> tuple[bool, st
             [XRAY_BIN, "run", "-c", XRAY_CONFIG],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
-        time.sleep(0.3)
+        time.sleep(1.5)
         if _xray_proc.poll() is not None:
             out, _ = _xray_proc.communicate()
             _log(f"xray 启动失败: {out}")
             return False, f"xray 进程退出: {out[:500]}"
-        if not _wait_socks5_ready():
-            _log("⚠️ xray 进程已起但 socks5 端口 5s 内未就绪")
         _log(f"xray 启动成功 (自定义配置), PID={_xray_proc.pid}")
         return True, ""
     except Exception as e:
@@ -259,13 +243,11 @@ def start_xray(node: dict[str, Any]) -> tuple[bool, str]:
             stderr=subprocess.STDOUT,
             text=True,
         )
-        time.sleep(0.3)
+        time.sleep(1.5)
         if _xray_proc.poll() is not None:
             out, _ = _xray_proc.communicate()
             _log(f"xray 启动失败: {out}")
             return False, f"xray 进程退出: {out[:500]}"
-        if not _wait_socks5_ready():
-            _log("⚠️ xray 进程已起但 socks5 端口 5s 内未就绪")
         _log(f"xray 启动成功, PID={_xray_proc.pid}")
         return True, ""
     except Exception as e:

@@ -68,24 +68,6 @@ class APIKeyManager:
                         valid_count += 1
                         logger.debug(f"加载密钥: {key_name} ({api_key[:8]}...)")
 
-            # 支持通过环境变量 API_KEY 注入密钥（生产环境强烈推荐）
-            env_key = os.environ.get("API_KEY", "").strip()
-            if env_key:
-                if not env_key.startswith("sk-"):
-                    env_key = "sk-" + env_key
-                with self._lock:
-                    self.api_keys.add(env_key)
-                    self.key_names[env_key] = "env:API_KEY"
-                logger.success(f"已从环境变量加载 API 密钥 ({env_key[:8]}...)")
-                valid_count += 1
-
-            # 默认密钥告警
-            if "sk-123456" in self.api_keys and not env_key:
-                logger.warning("=" * 60)
-                logger.warning("正在使用默认 API 密钥 sk-123456，公网访问极不安全")
-                logger.warning("请在 Replit Secrets 中设置 API_KEY 来覆盖")
-                logger.warning("=" * 60)
-
             if valid_count > 0:
                 logger.success(f"成功加载 {valid_count} 个 API 密钥")
             if error_count > 0:
