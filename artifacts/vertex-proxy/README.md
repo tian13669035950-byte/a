@@ -11,8 +11,9 @@
 - **SOCKS5 代理轮换**：内置 xray 代理管理，支持 Clash 订阅节点，自动轮换 IP 避免单 IP 配额耗尽
 - **浏览器 TLS 指纹伪装**：使用 primp（Rust 静态链接 BoringSSL），通过 Google 的浏览器检测
 - **假流式模式（fs- 前缀）**：非流式底层 + 模拟逐字输出，解决 batchGraphql 接口本身不支持真流式的问题
+- **空回复自动重试**：检测到 Gemini 返回空内容时自动换节点重试，确保客户端收到有效回复
 - **Web 管理界面**：`/proxy-manager`，可切换节点、查看日志、添加自定义节点
-- **SillyTavern 兼容**：SSE 格式严格遵守 OpenAI 规范（内容块与 finish_reason 分开发送）
+- **SillyTavern 兼容**：SSE 格式严格遵守 OpenAI 规范，禁用中间层压缩，防止解码错误
 
 ---
 
@@ -85,16 +86,22 @@ __pycache__/
 
 ## 支持的模型
 
+所有模型均已通过实测验证可用。
+
 ### 普通模式（底层是 batchGraphql，结果一次性返回再流式转发）
 
-| 模型名 | 说明 |
-|--------|------|
-| `gemini-2.5-pro` | 最强推理，较慢 |
-| `gemini-2.5-flash` | 均衡（推荐） |
-| `gemini-2.5-flash-lite` | 最快，较轻量 |
-| `gemini-2.5-flash-image` | 支持图像输入 |
-| `gemini-3-flash-preview` | 下一代预览版 |
-| `gemini-3.1-flash-lite-preview` | 等其他预览版… |
+| 模型名 | 速度 | 说明 |
+|--------|------|------|
+| `gemini-2.5-flash` | 快 | 均衡，**日常推荐** |
+| `gemini-2.5-flash-lite` | 最快 | 轻量，适合简单任务 |
+| `gemini-2.5-flash-image` | 快 | 支持图片输入 |
+| `gemini-2.5-pro` | 中 | 最强推理 |
+| `gemini-2.5-flash-lite-preview-09-2025` | 快 | 配额较小，容易 429 |
+| `gemini-3-flash-preview` | **慢（30~60秒）** | 模型本身响应慢，不是出错 |
+| `gemini-3-pro-image-preview` | 中 | 支持图片 |
+| `gemini-3.1-flash-lite-preview` | 快 | |
+| `gemini-3.1-flash-image-preview` | 快 | 支持图片 |
+| `gemini-3.1-pro-preview` | 中 | |
 
 ### 假流式模式（fs- 前缀，逐字符分包发送，适合对流式体验有要求的场景）
 
@@ -122,7 +129,7 @@ __pycache__/
 | `tools` / `functions` | Function Calling | `tools.functionDeclarations` |
 | `stream` | 是否流式输出 | — |
 
-> **关于 `temperature`**：值越高 AI 回复越随机、有创意、"有趣"（funny），值越低越保守、严谨。一般聊天用 0.7~1.0，创意写作用 1.2~1.8，需要精确答案用 0.1~0.3。
+> **关于 `temperature`**：值越高 AI 回复越随机、有创意，值越低越保守、严谨。一般聊天用 0.7~1.0，创意写作用 1.2~1.8，需要精确答案用 0.1~0.3。
 
 ---
 
@@ -155,7 +162,7 @@ __pycache__/
 | 字段 | 说明 |
 |------|------|
 | `port_api` | API 服务端口（Replit 部署时被 PORT 环境变量覆盖，改这个没用） |
-| `max_retries` | 单次请求最多重试次数（遇到 401/403/429 自动重试） |
+| `max_retries` | 单次请求最多重试次数（遇到 401/403/429/空回复自动重试） |
 | `debug` | 改成 `true` 会输出详细的请求/响应日志，方便排错 |
 
 ### `config/api_keys.txt`
@@ -227,7 +234,7 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 **现象**：连续发几次请求就报 `Resource has been exhausted`，隔一段时间又好了。  
 **原因**：Google 按 IP 限速，Replit 的 IP 是共享的，很容易触发。  
-**解决**：请求改为代理优先——走 xray SOCKS5 代理，用代理节点的 IP 发请求，每个节点有独立配额。可以在管理界面手动切换节点。
+**解决**：请求改为代理优先——走 xray SOCKS5 代理，用代理节点的 IP 发请求，每个节点有独立配额。遇到 429 自动切换到下一个节点重试，也可以在管理界面手动切换。
 
 ---
 
@@ -276,6 +283,29 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 ---
 
+### 11. Gemini 有时返回空回复（无任何文字内容）
+
+**现象**：AI 回复是空白消息，没有报错。  
+**原因**：Gemini 偶尔会返回结构完整但没有文字内容的响应（`candidates` 存在但 `parts` 里没有 `text`），服务之前会把它当正常完成发出去。  
+**解决**：现在每次拿到 Gemini 响应后，先检测里面有没有实际文字。如果是空回复，自动换下一个代理节点并重试，直到拿到有内容的回复再发给客户端。重试次数由 `config.json` 的 `max_retries` 控制。
+
+---
+
+### 12. SillyTavern 报 "error decoding response body"
+
+**现象**：使用流式模式时，SillyTavern 弹出错误：  
+```
+[API Error] Custom OpenAI stream read failed: error decoding response body
+```
+**原因有两个**：  
+① SillyTavern 发请求时带了 `Accept-Encoding: gzip`，Replit 的部署层中间代理看到这个头后可能对 SSE 流进行了 gzip 压缩。SillyTavern 读 SSE 流时用原始字节直接 decode，没有先解压，导致解码失败。  
+② Gemini 返回错误 chunk（如 429）时，原来的代码直接把这个 chunk 丢掉，客户端收到不完整的流，某些情况下触发解析异常。  
+**解决**：  
+① 响应头加了 `Content-Encoding: identity`，明确告诉所有中间代理"不要压缩，原样转发"。  
+② 上游错误 chunk 现在会被转换成 OpenAI 错误格式透传给客户端，不再静默丢弃。
+
+---
+
 ## 请求流程
 
 ```
@@ -294,8 +324,10 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
               优先走 xray SOCKS5 代理（换 IP）
               失败则直连降级
                         ↓
-              gemini 响应 → openai 格式转换
+              检测响应内容：空回复 → 换节点重试
+              有内容 → gemini 格式转换为 openai 格式
               拆分最后一个 chunk（SillyTavern 兼容）
+              响应头加 Content-Encoding: identity（防压缩）
                         ↓
               SSE 流式返回给客户端
 ```
@@ -319,10 +351,13 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 ## 常见问题
 
 **Q：为什么有时会报 429？**  
-A：单个 IP 的配额用完了。去管理界面 `/proxy-manager` 切换到下一个节点换 IP 即可。
+A：单个 IP 的配额用完了。服务会自动换节点重试。如果还是失败，去管理界面 `/proxy-manager` 手动切换到下一个节点。
 
 **Q：为什么服务刚启动时第一次请求比较慢？**  
 A：启动后大约 4 秒才完成订阅拉取和节点选择。这段时间内的请求会走直连，速度正常，只是配额用的是 Replit IP。
+
+**Q：为什么回复前要等一段时间，然后文字一下子全出来？**  
+A：底层接口（batchGraphql）本身不支持真流式，Gemini 生成完全部内容才返回。如果想要逐字打印效果，换用 `fs-` 前缀的模型（如 `fs-gemini-2.5-flash`）。
 
 **Q：能不能同时用多个 Google 账号？**  
 A：目前没有多账号轮换，所有请求用同一个控制台接口（匿名 Recaptcha Token）。
@@ -332,3 +367,6 @@ A：不影响使用，忽略即可。
 
 **Q：xray 二进制是从哪来的？**  
 A：启动时自动检测 `bin/xray`，如果不存在会自动下载。
+
+**Q：SillyTavern 报 "error decoding response body" 怎么办？**  
+A：已在服务端修复（加了 `Content-Encoding: identity` 头）。如果还出现，检查 SillyTavern 连接的是不是最新发布的地址，而不是旧的缓存地址。
