@@ -322,15 +322,9 @@ def parse_upstream_data(raw_data: str) -> dict[str, Any]:
         state["has_error"] = True
         state["error_message"] = f"Parse error: {str(e)}"
     
-    # 组装 parts - 按 path_index 排序，每个 index 可能有多个 parts（列表）
-    parts_by_path = cast(dict[int, list[Any]], state['parts_by_path'])
-    ordered_parts: list[dict[str, Any]] = []
-    for k in sorted(parts_by_path.keys()):
-        parts_at_index = parts_by_path[k]
-        if isinstance(parts_at_index, list):
-            ordered_parts.extend(cast(list[dict[str, Any]], parts_at_index))
-        else:
-            ordered_parts.append(cast(dict[str, Any], parts_at_index))
+    # 组装 parts - 按 path_index 排序
+    parts_by_path = cast(dict[int, dict[str, Any]], state['parts_by_path'])
+    ordered_parts: list[dict[str, Any]] = [parts_by_path[k] for k in sorted(parts_by_path.keys())]
     unindexed_parts = cast(list[Any], state['unindexed_parts'])
     ordered_parts.extend(unindexed_parts)
     
@@ -359,13 +353,12 @@ def _update_state_from_data(state: dict[str, Any], data: dict[str, Any], path_in
         state.update(meta)
 
         # 提取 content parts
+        # 注意：同一 path_index 后到的 part 是流式更新的"完整态"（覆盖前一次的"中间态"），
+        # 因此用赋值而不是追加，保证每个流位置只保留最终值
         content = candidate.get('content', {})
         parts = content.get('parts', [])
         for part in parts:
             if path_index != -1:
-                # 用列表收集，避免同一 path_index 的多个 part 互相覆盖（截断 bug）
-                if path_index not in state['parts_by_path']:
-                    state['parts_by_path'][path_index] = []
-                state['parts_by_path'][path_index].append(part)
+                state['parts_by_path'][path_index] = part
             else:
                 state['unindexed_parts'].append(part)

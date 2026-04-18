@@ -312,11 +312,15 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 ---
 
-### 14. 回复内容被截断（parser parts 覆盖 bug）
+### 14. 回复内容被截断（响应流被中途切断）
 
-**现象**：AI 回复说到一半突然停了，比如"我是由谷歌训练的旅行。语言模型你可以，"然后什么都没了。  
-**原因**：batchGraphql 响应的某个 streaming chunk（path index）可能携带多个 `parts`（比如内容分多块返回，或者同时有思考块+内容块）。旧代码用 `dict[path_index] = part` 赋值，后面的 part 会覆盖前面的，丢失了中间的内容。  
-**解决**：改为 `dict[path_index]` 存列表，所有 parts 都追加进去，最后按顺序拼接，不再丢失任何块。
+**现象**：AI 回复说到一半突然停了，文本看起来语句不完整（"…然后你可以，"再无下文）。  
+**原因**：上游 batchGraphql 的 HTTP 流被中途切断（代理节点抖动 / Google 提前关闭连接 / 网络异常），但代码把残缺的 buffer 当成完整响应处理——里面有部分文字，于是直接发给客户端，看起来就像"截断"。  
+**判定方法**：完整的 Gemini 响应**必有 `finishReason`**（STOP / MAX_TOKENS / SAFETY 等）。如果响应里没有任何 `finishReason`，就是流被切断了。  
+**解决**：buffer 收完后双重判定——
+- 没文字 → 空回复，换节点重试
+- **有文字但没 finishReason → 截断响应，换节点重试**
+- 重试耗尽仍然不完整 → 原样发出并在日志里记录
 
 ---
 

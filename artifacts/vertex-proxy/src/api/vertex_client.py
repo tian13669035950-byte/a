@@ -258,6 +258,25 @@ class VertexAIClient:
                 pass
         return "".join(text_parts)
 
+    @staticmethod
+    def _has_finish_reason(chunks: list[str]) -> bool:
+        """判断响应是否完整结束（有 finishReason 标记）"""
+        for chunk_str in chunks:
+            actual = chunk_str.strip()
+            if actual.startswith("data: "):
+                actual = actual[6:]
+            if not actual:
+                continue
+            try:
+                obj = json.loads(actual)
+                for candidate in obj.get("candidates", []):
+                    fr = candidate.get("finishReason")
+                    if fr:
+                        return True
+            except Exception:
+                pass
+        return False
+
     async def _stream_chat_inner(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[str, Any]:
         """实际的流式聊天逻辑（内部方法）"""
         max_retries = self.max_retries
@@ -301,20 +320,35 @@ class VertexAIClient:
 
                     # 3. 检查是否有真实文字内容
                     actual_text = self._extract_text_from_sse_chunks(buffered_chunks)
-                    if not actual_text.strip() and attempt < max_retries:
-                        logger.warning(f"收到空回复（无文字内容），自动重试（第 {attempt + 1} 次）")
+                    has_finish = self._has_finish_reason(buffered_chunks)
+                    is_empty = not actual_text.strip()
+                    is_truncated = (not is_empty) and (not has_finish)
+
+                    if (is_empty or is_truncated) and attempt < max_retries:
+                        if is_empty:
+                            logger.warning(f"收到空回复（无文字内容），自动重试（第 {attempt + 1} 次）")
+                        else:
+                            logger.warning(
+                                f"响应被截断（缺少 finishReason，已收到 {len(actual_text)} 字符），"
+                                f"自动重试（第 {attempt + 1} 次）"
+                            )
                         # 尝试换一个代理节点再试（转满一圈自动重拉订阅）
                         switched = await self._rotate_with_refresh()
                         if switched:
-                            logger.info("空回复，已自动切换到下一个代理节点")
+                            logger.info("已自动切换到下一个代理节点")
                             await asyncio.sleep(2)
                         recaptcha_token = None  # 强制重新拿 token
                         attempt += 1
                         continue
 
                     # 4. 有内容（或已到重试上限）→ 全部发给客户端
-                    if not actual_text.strip():
+                    if is_empty:
                         logger.warning(f"重试耗尽，仍为空回复，原样发送（模型={model}）")
+                    elif is_truncated:
+                        logger.warning(
+                            f"重试耗尽，响应仍被截断（{len(actual_text)} 字符无 finishReason），"
+                            f"原样发送（模型={model}）"
+                        )
                     for chunk in buffered_chunks:
                         yield chunk
                         content_yielded = True
