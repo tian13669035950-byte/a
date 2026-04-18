@@ -306,10 +306,12 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
 
             return StreamingResponse(
                 openai_stream(),
-                media_type="text/event-stream",
+                media_type="text/event-stream; charset=utf-8",
                 headers={
                     "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no"
+                    "X-Accel-Buffering": "no",
+                    "Content-Encoding": "identity",
+                    "X-Content-Type-Options": "nosniff",
                 }
             )
         else:

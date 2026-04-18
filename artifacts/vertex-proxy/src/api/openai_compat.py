@@ -281,8 +281,24 @@ def gemini_sse_chunk_to_openai(
     将单个 Gemini SSE chunk (已解析的 JSON) 转换为 OpenAI SSE 格式字符串列表。
     返回空列表表示跳过该 chunk。若 chunk 同时含内容和 finish_reason，则拆为两条。
     """
+    # 上游错误 chunk（无 candidates）→ 转换为 OpenAI 错误格式透传，不静默丢弃
     candidates = gemini_chunk_json.get("candidates", [])
     if not candidates:
+        upstream_error = gemini_chunk_json.get("error")
+        if upstream_error:
+            err_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [],
+                "error": {
+                    "message": upstream_error.get("message", "Upstream error"),
+                    "type": "upstream_error",
+                    "code": str(upstream_error.get("code", "unknown")),
+                }
+            }
+            return [f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"]
         return []
 
     choices: list[dict[str, Any]] = []
