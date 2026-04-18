@@ -10,6 +10,7 @@ from src.core import (
 from src.api import VertexAIClient, create_app
 from src.core.auth import api_key_manager
 from src.utils.logger import get_logger, configure_logging, set_request_id
+from src.api.admin import router as admin_router, ensure_admin_password
 from proxy_manager.routes import router as proxy_router, restore_active_node
 
 logger = get_logger(__name__)
@@ -90,11 +91,13 @@ async def main() -> None:
     logger.info(f"API 端口: {port}")
 
     api_key_manager.load_keys()
+    ensure_admin_password()
 
     vertex_client = VertexAIClient()
 
     app = create_app(vertex_client)
     app.include_router(proxy_router)
+    app.include_router(admin_router)
 
     logger.info("恢复上次选中的代理节点...")
     restore_active_node()

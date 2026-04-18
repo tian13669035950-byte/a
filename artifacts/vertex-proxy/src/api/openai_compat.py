@@ -275,6 +275,8 @@ def gemini_response_to_openai(gemini_resp: dict[str, Any], model: str, stream: b
     }
 
 
+# ==================== 流式转换：单个 Gemini chunk → OpenAI SSE ====================
+
 def gemini_sse_chunk_to_openai(
     gemini_chunk_json: dict[str, Any],
     model: str,
@@ -408,6 +410,8 @@ def gemini_sse_chunk_to_openai(
     return results
 
 
+# ==================== 真流式转换：单个 Gemini result → 多条 SSE ====================
+
 def convert_realtime_chunk(
     gemini_chunk: dict[str, Any],
     model: str,
@@ -435,6 +439,8 @@ def convert_realtime_chunk(
     out.extend(gemini_sse_chunk_to_openai(gemini_chunk, model, completion_id, created))
     return out
 
+
+# ==================== 假流式 SSE 生成器（聚合后逐字符发送，老路径） ====================
 
 async def stream_gemini_as_openai(
     gemini_stream: AsyncGenerator[str, None],

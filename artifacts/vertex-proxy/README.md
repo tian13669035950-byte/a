@@ -369,6 +369,23 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 ---
 
+### 22. /admin 后台已加（独立于 /proxy-manager，不冲突）
+
+**功能**：
+- 自动密码：首次启动若 `config.json` 没有 `admin_password` 字段，自动生成 12 位随机密码并写入，**WARN 级别**打印到日志（Replit 这种环境唯一能看到密码的地方）
+- 7 天 cookie/Bearer 会话，重启服务即失效
+- 设置端：端口 / debug / max_retries / 改密码
+- API 密钥三段式 CRUD（`name:key:description`）
+- 同名添加自动覆盖；删除后立即热加载到 `api_key_manager`
+
+**踩坑**：
+- 中间件 `excluded_paths` 之前是 `path in 列表`（精确匹配），加 `/admin` 子路径会失败。已改成 `path == p OR path.startswith(p + "/")`。**禁止**改回精确匹配，否则 `/api/admin/login` 会被拦回 401。
+- 顺带"修复"了 `/proxy-manager` 子路径之前必须用硬编码 sk-123456 才能访问的问题，现在 `/proxy-manager/*` 也走前缀豁免（**这是有意为之**，proxy-manager UI 行为不变）。
+- API_KEYS 文件支持两种格式：旧 `name:key`（两段）+ 新 `name:key:description`（三段）。**禁止**移除 `parts[2] if len(parts)>=3` 的兼容逻辑。
+- 改了密码后**老 token 不会被吊销**（in-memory session 不知道密码变了）。这是 known limitation，要彻底踢人需重启服务。
+
+---
+
 ### 15. 所有 CF 节点测速延迟相同
 
 **现象**：点"一键测速排序"后，订阅里所有节点显示完全相同的延迟（如全部 29ms）。  

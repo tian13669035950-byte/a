@@ -99,7 +99,9 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         logger.debug(f"收到请求: {method} {path} from {client_ip}")
 
-        if self.excluded_paths and path in self.excluded_paths:
+        if self.excluded_paths and any(
+            path == p or path.startswith(p + "/") for p in self.excluded_paths
+        ):
             logger.debug(f"路径 {path} 在排除列表中，跳过认证")
             return await call_next(request)
 
@@ -152,7 +154,10 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         version="1.2.0"
     )
 
-    app.add_middleware(APIKeyMiddleware, excluded_paths=["/", "/health", "/proxy-manager"])
+    app.add_middleware(
+        APIKeyMiddleware,
+        excluded_paths=["/", "/health", "/proxy-manager", "/admin", "/api/admin"],
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -222,8 +227,26 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
                 async for chunk in vertex_client.stream_chat(model=model, gemini_payload=body):
                     yield chunk
             except VertexError as e:
+                try:
+                    save_error_snapshot(
+                        downstream_payload={"model": model, "stream": True, "body": body},
+                        upstream_payload={"gemini_payload": body},
+                        upstream_response=getattr(e, "upstream_response", "") or e.message,
+                        error_type=f"gemini_stream_{type(e).__name__}",
+                    )
+                except Exception:
+                    pass
                 yield e.to_sse()
             except Exception as e:
+                try:
+                    save_error_snapshot(
+                        downstream_payload={"model": model, "stream": True, "body": body},
+                        upstream_payload={"gemini_payload": body},
+                        upstream_response=str(e),
+                        error_type=f"gemini_stream_unhandled_{type(e).__name__}",
+                    )
+                except Exception:
+                    pass
                 error = InternalError(message=str(e))
                 yield error.to_sse()
 
@@ -243,7 +266,19 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         body: dict[str, Any] = cast(dict[str, Any], body_any)
 
         start_time = time.time()
-        response = await vertex_client.complete_chat(model=model, gemini_payload=body)
+        try:
+            response = await vertex_client.complete_chat(model=model, gemini_payload=body)
+        except VertexError as e:
+            try:
+                save_error_snapshot(
+                    downstream_payload={"model": model, "stream": False, "body": body},
+                    upstream_payload={"gemini_payload": body},
+                    upstream_response=getattr(e, "upstream_response", "") or e.message,
+                    error_type=f"gemini_nonstream_{type(e).__name__}",
+                )
+            except Exception:
+                pass
+            raise
         process_time = time.time() - start_time
         logger.success(f"[Gemini] 完成: 模型={model}, 耗时={process_time:.3f}s")
         return response
@@ -396,7 +431,19 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
             )
         else:
             start_time = time.time()
-            gemini_resp = await vertex_client.complete_chat(model=model, gemini_payload=gemini_payload)
+            try:
+                gemini_resp = await vertex_client.complete_chat(model=model, gemini_payload=gemini_payload)
+            except VertexError as e:
+                try:
+                    save_error_snapshot(
+                        downstream_payload={"model": model, "stream": False, "body": body},
+                        upstream_payload={"gemini_payload": gemini_payload},
+                        upstream_response=getattr(e, "upstream_response", "") or e.message,
+                        error_type=f"oai_nonstream_{type(e).__name__}",
+                    )
+                except Exception:
+                    pass
+                raise
             process_time = time.time() - start_time
             logger.success(f"[OpenAI] 完成: 模型={model}, 耗时={process_time:.3f}s")
             openai_resp = gemini_response_to_openai(gemini_resp, model, stream=False)

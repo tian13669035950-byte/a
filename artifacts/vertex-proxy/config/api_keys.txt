@@ -1,1 +1,2 @@
+# 格式: name:key:description （由管理面板维护）
 admin_key:sk-123456:Test Key
