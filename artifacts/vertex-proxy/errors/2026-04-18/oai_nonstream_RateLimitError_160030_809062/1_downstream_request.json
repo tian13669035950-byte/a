@@ -1,0 +1,14 @@
+{
+  "model": "gemini-2.5-flash",
+  "stream": false,
+  "body": {
+    "model": "gemini-2.5-flash",
+    "messages": [
+      {
+        "role": "user",
+        "content": "hi"
+      }
+    ],
+    "stream": false
+  }
+}

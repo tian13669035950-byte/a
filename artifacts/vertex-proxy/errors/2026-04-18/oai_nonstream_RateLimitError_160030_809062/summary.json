@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-04-18T16:00:30.809062",
+  "error_type": "oai_nonstream_RateLimitError",
+  "snapshot_id": "oai_nonstream_RateLimitError_160030_809062",
+  "files": [
+    "1_downstream_request.json",
+    "2_upstream_request.json",
+    "3_upstream_response.json"
+  ],
+  "metadata": {}
+}

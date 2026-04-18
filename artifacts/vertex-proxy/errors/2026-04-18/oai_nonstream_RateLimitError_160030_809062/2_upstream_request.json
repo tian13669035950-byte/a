@@ -1,0 +1,14 @@
+{
+  "gemini_payload": {
+    "contents": [
+      {
+        "role": "user",
+        "parts": [
+          {
+            "text": "hi"
+          }
+        ]
+      }
+    ]
+  }
+}

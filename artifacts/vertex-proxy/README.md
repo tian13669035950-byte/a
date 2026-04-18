@@ -82,6 +82,7 @@ artifacts/vertex-proxy/
 | `API_KEY` | 可选 | 不加就用默认 `sk-123456`。**如果只是你自己用、URL 不外传，默认就行**；要给别人用就改成自定义随机串 |
 | `ADMIN_PASSWORD` | 可选 | 不加就用硬编码的 `1966197012` |
 | `SESSION_SECRET` | 推荐 | 从 dev 复制过去 |
+| `STRICT_PROXY` | 已默认 `1` | **强制所有出网走 SOCKS5 代理，禁止任何直连**。设 `0` 才允许代理失败时降级直连（仅本地调试用，部署绝对不要关）|
 
 #### ✅ 不需要
 
@@ -614,6 +615,8 @@ errors/
 | 给 `/v1/chat/completions` SSE 流加心跳（`: ping\n\n`）| SillyTavern 等客户端遇到非 `data:` 行会异常 | #16 |
 | 全局强制 `fake_stream=True` | 慢模型首字节等 30-60 秒，看起来卡死 | #17 |
 | 加"代理全失败兜底走直连"的 ContextVar | 违背用代理保护 Replit IP 配额的初衷 | #18 |
+| 把 `STRICT_PROXY` 默认值改成 `0`，或在严格模式下加任何"直连兜底"路径 | 即使 Vertex 调用走了代理，recaptcha 走直连也会让 Google 关联 Replit IP，整个池子被限流 | #29 |
+| 把 `fetch_recaptcha_token` 改回"直连优先"策略 | 直连等于把 Replit 出口 IP 暴露给 Google，几次后整个共享 IP 段被全局限流 | #29 |
 | 给 vertex 响应加"无 finishReason 就当截断重试" | 部分模型合法响应末包就是无 finishReason，会触发不必要重试浪费配额 | 历史 |
 | 直接编辑 `artifact.toml` / `.replit` | 应该用平台工件管理工具改 | — |
 | 把 admin 接口路径用 `/api/admin/*` | 会被同 monorepo 里的 api-server 抢走，永远 404 | #23 |
