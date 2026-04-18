@@ -20,7 +20,7 @@ from src.utils.logger import get_logger
 # 从拆分的模块导入
 from .model_config import ModelConfigBuilder
 from .transform import RequestTransformer, ResponseAggregator
-from .network import NetworkClient
+from .network import NetworkClient, force_direct_var
 
 # 初始化日志
 logger = get_logger(__name__)
@@ -294,6 +294,16 @@ class VertexAIClient:
         session = self.network.create_session()
         try:
             while attempt <= max_retries:
+                # 兜底直连：当所有代理都试过且仍失败时，最后一次重试改走 Replit 直连
+                # （牺牲 Replit IP 配额换取一个能给用户的回答，避免直接 429）
+                is_last_resort = (attempt == max_retries)
+                direct_token = None
+                if is_last_resort:
+                    direct_token = force_direct_var.set(True)
+                    logger.warning(f"⚠️ 已达最大重试次数 ({max_retries})，启用兜底直连（走 Replit IP）")
+                    # 直连 IP 与之前代理 IP 不同，必须重新获取 recaptcha
+                    recaptcha_token = None
+
                 # 1. 获取 Recaptcha Token
                 if not recaptcha_token:
                     recaptcha_token = await self.network.fetch_recaptcha_token(session)
@@ -423,4 +433,10 @@ class VertexAIClient:
                     await asyncio.sleep(1)
                     continue
         finally:
+            # 重置兜底直连开关，避免污染 ContextVar
+            try:
+                if force_direct_var.get():
+                    force_direct_var.set(False)
+            except Exception:
+                pass
             await session.close()

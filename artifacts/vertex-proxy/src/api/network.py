@@ -14,6 +14,7 @@ Vertex AI 网络客户端
 import re
 import random
 import socket
+import contextvars
 from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup
 from typing import Any, AsyncGenerator, Optional
@@ -23,6 +24,14 @@ from src.core.config import load_config
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 兜底直连开关（per-request 上下文变量）：
+# 当所有代理节点都失败/耗尽配额时，调用方可在最后一次重试前
+# 设置为 True，让本次请求直接走 Replit 出口（牺牲 Replit IP 配额
+# 换取一个能给用户的回答），避免直接 429 失败。
+force_direct_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "vertex_force_direct", default=False
+)
 
 RECAPTCHA_ANCHOR = (
     "https://www.google.com/recaptcha/enterprise/anchor"
@@ -209,6 +218,17 @@ class NetworkClient:
         将"换 IP 用 token"识别为可疑请求并返回空响应。
         直连只在没有代理或代理彻底失败时作为兜底。
         """
+        # 兜底直连模式：跳过代理，直接走 Replit 出口
+        if force_direct_var.get():
+            logger.warning("兜底直连模式：Recaptcha 不走代理")
+            for attempt in range(3):
+                token = await _do_recaptcha_request(None)
+                if token:
+                    return token
+                logger.debug(f"兜底直连 recaptcha 失败 ({attempt+1}/3)")
+            logger.error("兜底直连 Recaptcha Token 获取失败")
+            return None
+
         proxy = _get_proxy() if _socks5_reachable() else None
 
         # 严格代理模式：有代理时只走代理；代理全失败才允许直连（仅在没配置任何代理时）
@@ -244,6 +264,19 @@ class NetworkClient:
         发送非流式 POST 请求。
         策略：代理优先（不同 IP 分摊配额），失败降级直连。
         """
+        # 兜底直连模式：直接走 Replit 出口
+        if force_direct_var.get():
+            logger.warning("兜底直连模式：POST 请求绕过代理")
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(45.0), verify=True) as client:
+                    resp = await client.post(url, headers=headers, json=json_data)
+                    return HttpxStreamingFakeResponse(resp)
+            except Exception as e:
+                logger.warning(f"兜底直连 httpx POST 失败，降级到 primp: {e}")
+                async with _build_async_client(proxy=None) as client:
+                    resp = await client.post(url, headers=headers, json=json_data, timeout=30)
+                    return FakeResponse(resp)
+
         proxy = _get_proxy() if _socks5_reachable() else None
 
         # 严格代理模式：配置了代理就只走代理（不烧 Replit IP）
@@ -283,6 +316,21 @@ class NetworkClient:
         策略：代理优先（不同 IP 分摊配额），失败才直连。
         httpx 支持边收边发（真正流式），primp 会等全部接收完才返回。
         """
+        # 兜底直连模式：直接走 Replit 出口
+        if force_direct_var.get():
+            logger.warning("兜底直连模式：stream 请求绕过代理")
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), verify=True) as client:
+                    async with client.stream(method, url, headers=headers, json=json_data) as resp:
+                        yield HttpxStreamingFakeResponse(resp)
+                        return
+            except Exception as e:
+                logger.warning(f"兜底直连 httpx stream 失败，降级到 primp: {e}")
+                async with _build_async_client(proxy=None) as client:
+                    resp = await client.request(method, url, headers=headers, json=json_data, timeout=60)
+                    yield FakeResponse(resp)
+                    return
+
         proxy = _get_proxy() if _socks5_reachable() else None
         last_exc: Optional[Exception] = None
 
