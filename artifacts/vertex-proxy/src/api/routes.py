@@ -1,9 +1,10 @@
 """FastAPI路由模块"""
 
+import asyncio
 import json
 import time
 import uuid
-from typing import Any, cast
+from typing import Any, AsyncGenerator, cast
 import collections.abc
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
@@ -27,6 +28,51 @@ from src.core.auth import api_key_manager
 from src.utils.logger import get_logger, set_request_id
 
 logger = get_logger(__name__)
+
+
+async def with_sse_heartbeat(
+    source: AsyncGenerator[str, None],
+    interval: float = 3.0,
+) -> AsyncGenerator[str, None]:
+    """
+    给 SSE 流加心跳：上游每隔 interval 秒没数据就发一行 SSE 注释（": ping\\n\\n"），
+    防止聊天客户端因首字节超时而主动断开连接。
+    SSE 注释行会被任何符合规范的客户端忽略，但 TCP 连接保持活跃。
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    SENTINEL = object()
+
+    async def producer() -> None:
+        try:
+            async for chunk in source:
+                await queue.put(chunk)
+        except Exception as e:
+            await queue.put(("__error__", e))
+        finally:
+            await queue.put(SENTINEL)
+
+    task = asyncio.create_task(producer())
+    # 立刻发一个心跳，让客户端知道连接已建立
+    yield ": connected\n\n"
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is SENTINEL:
+                return
+            if isinstance(item, tuple) and item and item[0] == "__error__":
+                raise item[1]
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 def extract_api_key_from_request(request: Request) -> str | None:
@@ -200,7 +246,14 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
                 error = InternalError(message=str(e))
                 yield error.to_sse()
 
-        return StreamingResponse(stream_generator(), media_type="application/json")
+        return StreamingResponse(
+            with_sse_heartbeat(stream_generator()),
+            media_type="text/event-stream; charset=utf-8",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
     app.post("/v1beta/models/{model}:streamGenerateContent", response_model=None)(stream_generate_content)
 
     async def generate_content(model: str, request: Request) -> JSONResponse | dict[str, Any]:
@@ -305,7 +358,7 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(
-                openai_stream(),
+                with_sse_heartbeat(openai_stream()),
                 media_type="text/event-stream; charset=utf-8",
                 headers={
                     "Cache-Control": "no-cache",
