@@ -13,11 +13,8 @@ run = "cd artifacts/vertex-proxy && PORT=8000 python3 main.py"
 
 [services.production]
 
-[services.production.build]
-args = ["bash", "-c", "pip3 install -r artifacts/vertex-proxy/requirements.txt -q"]
-
 [services.production.run]
-args = ["bash", "-c", "cd artifacts/vertex-proxy && python3 main.py"]
+args = ["bash", "-c", "python3 -m pip install -r artifacts/vertex-proxy/requirements.txt -q && cd artifacts/vertex-proxy && python3 main.py"]
 
 [services.production.run.env]
 PORT = "8000"
