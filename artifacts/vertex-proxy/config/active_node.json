@@ -1,0 +1,20 @@
+{
+  "mode": "xray",
+  "node": {
+    "protocol": "vless",
+    "name": "CF官方优选 14",
+    "uuid": "73bcd72f-9545-4cb8-8daf-7d004501880d",
+    "address": "198.41.223.166",
+    "port": 443,
+    "network": "ws",
+    "security": "tls",
+    "sni": "tian110110.us.ci",
+    "path": "/proxyip=8.219.155.125,8.222.185.236,198.13.37.176,45.32.17.67",
+    "host": "tian110110.us.ci",
+    "fp": "chrome",
+    "skip_cert_verify": false,
+    "colo": "SEA",
+    "country": "US",
+    "exit_ip": "34.127.47.89"
+  }
+}
