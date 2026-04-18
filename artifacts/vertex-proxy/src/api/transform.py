@@ -681,7 +681,7 @@ class ResponseAggregator:
                 "parts": all_parts,
                 "role": "model"
             },
-            "finishReason": finish_reason.upper(),
+            "finishReason": (finish_reason or "STOP").upper(),
             "index": candidate_index
         }
         

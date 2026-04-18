@@ -49,6 +49,17 @@ def _get_proxy() -> Optional[str]:
         return None
 
 
+def _rotate_proxy() -> Optional[str]:
+    """同步轮换到下一个节点，返回新的代理地址；失败返回 None"""
+    try:
+        from proxy_manager import proxy_state as _ps
+        if _ps.get_node_count() > 1 and _ps.rotate_to_next():
+            return _ps.get_proxy()
+    except Exception:
+        pass
+    return None
+
+
 def _socks5_reachable(host: str = "127.0.0.1", port: int = 1080, timeout: float = 1.0) -> bool:
     """快速检查 SOCKS5 端口是否监听中"""
     try:
@@ -176,31 +187,29 @@ class NetworkClient:
     async def fetch_recaptcha_token(self, session: Any) -> Optional[str]:
         """
         获取 Google Recaptcha Token。
-        策略：
-          1. 若代理可用 → 优先走代理（绕过IP检测）
-          2. 代理不可用/失败 → 直连（primp Chrome指纹仍能通过检测）
-        每种方式最多重试 3 次。
+        策略：直连优先（primp Chrome TLS 指纹可靠绕过 Google 检测）。
+        直连失败时尝试代理，防止极端网络环境下直连不可用。
         """
-        proxy = _get_proxy()
-        proxy_alive = bool(proxy) and _socks5_reachable()
+        # 1. 直连（primp 伪装 Chrome，生产/开发均可靠）
+        for attempt in range(3):
+            token = await _do_recaptcha_request(None)
+            if token:
+                logger.debug("直连模式获取 Recaptcha Token 成功")
+                return token
+            logger.debug(f"直连 recaptcha 失败 ({attempt+1}/3)")
 
-        if proxy_alive:
+        # 2. 直连失败才尝试代理（兜底）
+        proxy = _get_proxy()
+        if proxy and _socks5_reachable():
+            logger.warning("直连 recaptcha 全部失败，尝试代理模式")
             for attempt in range(3):
                 token = await _do_recaptcha_request(proxy)
                 if token:
                     logger.debug("代理模式获取 Recaptcha Token 成功")
                     return token
                 logger.warning(f"代理模式 recaptcha 失败 ({attempt+1}/3)")
-            logger.warning("代理模式全部失败，降级直连")
 
-        for attempt in range(3):
-            token = await _do_recaptcha_request(None)
-            if token:
-                logger.debug("直连模式获取 Recaptcha Token 成功")
-                return token
-            logger.warning(f"直连模式 recaptcha 失败 ({attempt+1}/3)")
-
-        logger.error("Recaptcha Token 获取失败（代理+直连均已尝试）")
+        logger.error("Recaptcha Token 获取失败（直连+代理均已尝试）")
         return None
 
     def create_session(self) -> MockSession:
@@ -252,7 +261,10 @@ class NetworkClient:
         last_exc: Optional[Exception] = None
 
         # 1. httpx + 代理（不同 IP，配额独立，真正流式）
-        if proxy:
+        # 代理连接失败时自动换下一个节点再试，而不是立刻降级直连
+        proxy_attempts = 0
+        while proxy and proxy_attempts < 3:
+            proxy_attempts += 1
             try:
                 async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(60.0), verify=True) as client:
                     async with client.stream(method, url, headers=headers, json=json_data) as resp:
@@ -265,8 +277,16 @@ class NetworkClient:
                     from src.core.errors import InternalError
                     logger.warning(f"代理 stream 超时，将触发重试: {e}")
                     raise InternalError(message="Upstream request timed out, retrying...")
-                logger.warning(f"httpx 代理 stream 失败，降级直连: {type(e).__name__}: {e}")
+                logger.warning(f"httpx 代理 stream 失败（第{proxy_attempts}次），尝试换节点: {type(e).__name__}: {e}")
                 last_exc = e
+                new_proxy = _rotate_proxy()
+                if new_proxy:
+                    proxy = new_proxy
+                    logger.info(f"已切换到新代理节点，继续重试")
+                else:
+                    break  # 无更多节点可用
+        if proxy_attempts > 0:
+            logger.warning("代理 stream 全部失败，降级直连")
 
         # 2. httpx 直连降级（真正流式，同 Replit IP，配额有限）
         try:

@@ -68,7 +68,7 @@ class StreamProcessor:
     ) -> str:
         """根据聚合后的内容，创建一个包含完整上下文的Gemini格式SSE事件。"""
         candidate: dict[str, Any] = {
-            "finishReason": finish_reason.upper(),
+            "finishReason": (finish_reason or "STOP").upper(),
             "index": candidate_index
         }
         
