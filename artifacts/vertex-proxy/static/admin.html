@@ -293,7 +293,8 @@
   <div class="tabs">
     <button class="tab active" data-tab="server">Server</button>
     <button class="tab" data-tab="keys">API Keys</button>
-    <a class="tab" href="/proxy-manager" style="text-decoration:none;display:inline-flex;align-items:center;">Proxy Manager →</a>
+    <button class="tab" data-tab="proxy">Proxy &amp; Nodes</button>
+    <a class="tab" href="/proxy-manager" style="text-decoration:none;display:inline-flex;align-items:center;margin-left:auto;color:var(--fg-muted);">Advanced →</a>
   </div>
 
   <div class="main">
@@ -375,6 +376,62 @@
           </thead>
           <tbody id="keysTbody"></tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- PROXY -->
+    <div class="panel" id="panel-proxy">
+      <div class="section">
+        <h2>Status.</h2>
+        <div class="h2-sub">当前出口代理状态。直连模式下 Replit IP 配额会被消耗。</div>
+        <div id="proxyStatusBox" style="display:flex;flex-wrap:wrap;gap:24px;align-items:center;font-family:var(--mono);font-size:12px;">
+          <span class="field-hint">loading…</span>
+        </div>
+        <div class="actions">
+          <button class="btn btn-sm" onclick="loadProxyStatus()">Refresh</button>
+          <button class="btn btn-sm btn-danger" onclick="stopProxy()">Stop / Direct</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Subscriptions.</h2>
+        <div class="h2-sub">订阅链接管理。多条链接的节点会合并去重。</div>
+        <div>
+          <label>新增订阅地址</label>
+          <input type="text" id="newSubUrl" placeholder="https://example.com/sub?token=...">
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="addSubUrl()">+ Add</button>
+        </div>
+        <table class="table" style="margin-top:18px;">
+          <thead><tr><th>URL</th><th style="width:80px;"></th></tr></thead>
+          <tbody id="subUrlsTbody"></tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h2>Nodes.</h2>
+        <div class="h2-sub">点击任意节点即启用为出口代理。Refresh 会重新拉取所有订阅。</div>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="refreshNodes()">Refresh nodes</button>
+          <span id="nodesSummary" class="field-hint"></span>
+        </div>
+        <table class="table" style="margin-top:18px;">
+          <thead><tr><th>#</th><th>Name</th><th>Server</th><th>Country</th><th>Latency</th><th style="width:80px;"></th></tr></thead>
+          <tbody id="nodesTbody"></tbody>
+        </table>
+      </div>
+
+      <div class="section">
+        <h2>Manual proxy.</h2>
+        <div class="h2-sub">不用订阅？直接填一个 socks5 / http 代理地址。</div>
+        <div>
+          <label>Proxy URL</label>
+          <input type="text" id="manualProxy" placeholder="socks5://host:port  /  http://host:port">
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="useManualProxy()">Use manual</button>
+        </div>
       </div>
     </div>
 
@@ -471,6 +528,7 @@ async function loadAll() {
   try {
     await loadSettings();
     await loadKeys();
+    await loadProxyAll();
   } catch (e) {
     /* handled */
   }
@@ -571,6 +629,149 @@ async function deleteKey(name) {
   } catch (e) { showToast(e.message, 'err'); }
 }
 
+
+/* ============= PROXY ============= */
+async function pmFetch(method, path, body) {
+  const opts = { method, headers: { 'Content-Type': 'application/json' } };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const res = await fetch('/proxy-manager' + path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || data.detail || ('HTTP ' + res.status));
+  return data;
+}
+
+async function loadProxyAll() {
+  await Promise.all([loadProxyStatus(), loadSubUrls(), loadNodes(false)]);
+}
+
+async function loadProxyStatus() {
+  try {
+    const s = await pmFetch('GET', '/status');
+    const box = document.getElementById('proxyStatusBox');
+    const proxy = s.proxy || '<span style="color:var(--err)">DIRECT (no proxy)</span>';
+    const xrayDot = s.xray_running
+      ? '<span style="color:var(--ok)">● running</span>'
+      : '<span style="color:var(--fg-dim)">○ stopped</span>';
+    const reach = s.google_reachable
+      ? `<span style="color:var(--ok)">● reachable (${s.latency_ms}ms)</span>`
+      : '<span style="color:var(--fg-dim)">○ unreachable</span>';
+    box.innerHTML = `
+      <div><span class="field-hint">Proxy:</span> ${proxy}</div>
+      <div><span class="field-hint">xray:</span> ${xrayDot}</div>
+      <div><span class="field-hint">Outbound:</span> ${reach}</div>
+      <div><span class="field-hint">Nodes loaded:</span> ${s.node_count || 0}</div>
+    `;
+  } catch (e) {
+    document.getElementById('proxyStatusBox').innerHTML =
+      `<span style="color:var(--err)">${escapeHtml(e.message)}</span>`;
+  }
+}
+
+async function stopProxy() {
+  if (!confirm('停止代理改为直连？这会消耗 Replit IP 配额。')) return;
+  try {
+    await pmFetch('POST', '/clear');
+    showToast('已停止', 'ok');
+    await loadProxyStatus();
+  } catch (e) { showToast(e.message, 'err'); }
+}
+
+async function loadSubUrls() {
+  try {
+    const data = await pmFetch('GET', '/sub-urls');
+    const tbody = document.getElementById('subUrlsTbody');
+    tbody.innerHTML = '';
+    if (!data.urls || !data.urls.length) {
+      tbody.innerHTML = '<tr><td colspan="2" class="empty">还没有订阅链接</td></tr>';
+      return;
+    }
+    data.urls.forEach((u, i) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="mono-cell" style="word-break:break-all;">${escapeHtml(u)}</td>
+        <td><button class="btn btn-sm btn-danger" onclick="delSubUrl(${i})">Delete</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (e) { /* silent */ }
+}
+
+async function addSubUrl() {
+  const url = document.getElementById('newSubUrl').value.trim();
+  if (!url) { showToast('URL 不能为空', 'err'); return; }
+  try {
+    await pmFetch('POST', '/sub-urls', { url });
+    document.getElementById('newSubUrl').value = '';
+    showToast('已添加', 'ok');
+    await loadSubUrls();
+  } catch (e) { showToast(e.message, 'err'); }
+}
+
+async function delSubUrl(i) {
+  if (!confirm('删除该订阅？')) return;
+  try {
+    await pmFetch('DELETE', '/sub-urls/' + i);
+    await loadSubUrls();
+    showToast('已删除', 'ok');
+  } catch (e) { showToast(e.message, 'err'); }
+}
+
+async function refreshNodes() {
+  document.getElementById('nodesSummary').textContent = 'fetching…';
+  await loadNodes(true);
+}
+
+async function loadNodes(refresh) {
+  try {
+    const data = await pmFetch('GET', '/list?refresh=' + (refresh ? 'true' : 'false'));
+    const tbody = document.getElementById('nodesTbody');
+    tbody.innerHTML = '';
+    const nodes = data.nodes || [];
+    document.getElementById('nodesSummary').textContent =
+      nodes.length ? `${nodes.length} nodes${data.from_cache ? ' (cached)' : ''}${data.detecting ? ' · detecting countries…' : ''}` : '';
+    if (!nodes.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">没有节点。先添加订阅链接，然后点 Refresh nodes。</td></tr>';
+      return;
+    }
+    nodes.forEach((n, i) => {
+      const lat = (n.latency_ms != null && n.latency_ms >= 0) ? n.latency_ms + 'ms' : '—';
+      const country = n.country || n.colo || '—';
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="mono-cell">${i}</td>
+        <td>${escapeHtml(n.name || '')}</td>
+        <td class="mono-cell">${escapeHtml(n.server || '')}</td>
+        <td>${escapeHtml(country)}</td>
+        <td class="mono-cell">${lat}</td>
+        <td><button class="btn btn-sm btn-primary" onclick="useNode(${i})">Use</button></td>
+      `;
+      tbody.appendChild(tr);
+    });
+  } catch (e) {
+    document.getElementById('nodesTbody').innerHTML =
+      `<tr><td colspan="6" class="empty" style="color:var(--err);">${escapeHtml(e.message)}</td></tr>`;
+    document.getElementById('nodesSummary').textContent = '';
+  }
+}
+
+async function useNode(index) {
+  try {
+    const r = await pmFetch('POST', '/select', { index });
+    showToast('已切换: ' + (r.node || r.proxy), 'ok');
+    await loadProxyStatus();
+  } catch (e) { showToast(e.message, 'err'); }
+}
+
+async function useManualProxy() {
+  const manual = document.getElementById('manualProxy').value.trim();
+  if (!manual) { showToast('Proxy URL 不能为空', 'err'); return; }
+  try {
+    await pmFetch('POST', '/select', { manual });
+    showToast('已切换到手动代理', 'ok');
+    document.getElementById('manualProxy').value = '';
+    await loadProxyStatus();
+  } catch (e) { showToast(e.message, 'err'); }
+}
 
 /* ============= UTIL ============= */
 function escapeHtml(s) {
