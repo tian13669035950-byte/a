@@ -168,10 +168,19 @@ class HttpxStreamingFakeResponse:
 
 
 class MockSession:
-    """primp 模式下的占位 session，兼容旧接口中的 session.close() 调用"""
+    """primp 模式下的占位 session，兼容旧接口中的 session.close() 和 async with 调用"""
 
     async def close(self):
         pass
+
+    async def aclose(self):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class NetworkClient:
