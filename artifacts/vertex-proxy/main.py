@@ -1,6 +1,8 @@
 """Vertex AI Proxy 入口"""
 import asyncio
 import os
+import random
+import time
 import uvicorn
 
 from src.core import (
@@ -14,6 +16,44 @@ from src.api.admin import router as admin_router, ensure_admin_password
 from proxy_manager.routes import router as proxy_router, restore_active_node
 
 logger = get_logger(__name__)
+
+
+async def _keepalive_loop(port: int) -> None:
+    """
+    保活循环：免费 Replit 容器空闲时会被休眠，本任务用随机间隔自 ping，
+    顺便循环访问几个轻量端点，让事件循环 / 上游连接保持温热。
+    - 间隔随机 180-420 秒（避免出现规律性流量被外部判定为机器流量）
+    - 路径在小集合内轮换 + 随机 query 参数防缓存
+    - 任何异常都吞掉，不影响主服务
+    """
+    import httpx
+
+    paths = ["/health", "/admin/api/status", "/proxy-manager/api/status"]
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 KeepAlive/1.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 KeepAlive/1.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 KeepAlive/1.0",
+    ]
+    base = f"http://127.0.0.1:{port}"
+
+    # 启动后等 30 秒再开始，避开主服务初始化
+    await asyncio.sleep(30)
+    logger.info(f"[KeepAlive] 启动，目标 {base}，间隔 180-420 秒随机")
+
+    while True:
+        try:
+            path = random.choice(paths)
+            ua = random.choice(user_agents)
+            ts = int(time.time())
+            url = f"{base}{path}?_={ts}&r={random.randint(1000, 9999)}"
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url, headers={"User-Agent": ua})
+                logger.debug(f"[KeepAlive] {path} -> {r.status_code}")
+        except Exception as e:
+            logger.debug(f"[KeepAlive] ping 失败（忽略）: {e}")
+
+        # 随机间隔 3-7 分钟
+        await asyncio.sleep(random.randint(180, 420))
 
 
 async def _auto_init_proxy() -> None:
@@ -117,6 +157,8 @@ async def main() -> None:
 
     # 启动后台自动初始化代理（不阻塞服务器）
     asyncio.create_task(_auto_init_proxy())
+    # 启动保活循环（免费容器防休眠）
+    asyncio.create_task(_keepalive_loop(port))
 
     try:
         await server.serve()

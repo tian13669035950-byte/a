@@ -1,7 +1,8 @@
 {
   "_说明": "Vertex AI Proxy 配置文件",
   "port_api": 2156,
-  "max_retries": 8,
+  "max_retries": 4,
+  "max_retries_说明": "免费额度友好：原 8 次太凶，遇配额错误最多再换 2 次 IP（quota_max_retries=2，硬编码在 vertex_client）",
   "error_dir": "errors",
   "debug": false,
   "debug_说明": "调试模式: true=DEBUG级别详细日志, false=INFO级别正常日志",
