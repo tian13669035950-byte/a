@@ -23,6 +23,26 @@ CUSTOM_NODES_FILE = os.path.join(PROJ_ROOT, "config", "custom_nodes.json")
 ACTIVE_NODE_FILE = os.path.join(PROJ_ROOT, "config", "active_node.json")
 CACHED_NODES_FILE = os.path.join(PROJ_ROOT, "config", "cached_nodes.json")
 SETTINGS_FILE = os.path.join(PROJ_ROOT, "config", "settings.json")
+SUB_URLS_FILE = os.path.join(PROJ_ROOT, "config", "sub_urls.json")
+
+_bench_running: bool = False
+_bench_results: dict = {}  # index -> latency_ms or None
+
+
+def _load_sub_urls() -> list:
+    try:
+        if os.path.exists(SUB_URLS_FILE):
+            with open(SUB_URLS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return [SUB_URL]
+
+
+def _save_sub_urls(urls: list):
+    os.makedirs(os.path.dirname(SUB_URLS_FILE), exist_ok=True)
+    with open(SUB_URLS_FILE, "w", encoding="utf-8") as f:
+        json.dump(urls, f, indent=2, ensure_ascii=False)
 
 
 # ── 设置（国家优先级）─────────────────────────────────────────────────────────
@@ -246,24 +266,29 @@ async def ui():
 async def list_nodes(refresh: bool = False):
     global _cached_nodes
     if refresh:
-        # 手动刷新：重新从订阅URL拉取，立即返回；后台异步检测国家
-        try:
-            raw_nodes = fetch_and_parse(SUB_URL)
-        except Exception as e:
+        # 手动刷新：从所有订阅 URL 拉取，合并去重
+        urls = _load_sub_urls()
+        raw_nodes = []
+        errors = []
+        for url in urls:
+            try:
+                raw_nodes.extend(fetch_and_parse(url))
+            except Exception as e:
+                errors.append(str(e))
+        if not raw_nodes:
             if not _cached_nodes:
-                return JSONResponse({"error": str(e), "nodes": []}, status_code=502)
-            raw_nodes = _cached_nodes  # 拉取失败保持旧列表
+                return JSONResponse({"error": "; ".join(errors) or "无订阅链接", "nodes": []}, status_code=502)
+            raw_nodes = _cached_nodes
 
-        # 把已有的 country/colo 数据合并过来（避免刷新后国家列全部清空）
+        # 合并已有 country/colo/latency_ms 数据
         old_map = {n.get("server"): n for n in _cached_nodes}
         merged = []
         for n in raw_nodes:
             old = old_map.get(n.get("server"), {})
             merged_node = dict(n)
-            if "country" not in merged_node and "country" in old:
-                merged_node["country"] = old["country"]
-                merged_node["colo"] = old.get("colo", "??")
-                merged_node["exit_ip"] = old.get("exit_ip", "")
+            for k in ("country", "colo", "exit_ip", "latency_ms"):
+                if k not in merged_node and k in old:
+                    merged_node[k] = old[k]
             merged.append(merged_node)
 
         priority = _get_priority()
@@ -271,31 +296,32 @@ async def list_nodes(refresh: bool = False):
         _save_nodes_to_disk(_cached_nodes)
         proxy_state.set_nodes(_cached_nodes)
 
-        # 后台检测出口国家（不阻塞返回）
         if not _detect_status["running"]:
             t = threading.Thread(target=_run_country_detection_bg, args=(_cached_nodes,), daemon=True)
             t.start()
 
     elif not _cached_nodes:
-        # 内存没有：先尝试磁盘缓存（不联网）
         disk = _load_nodes_from_disk()
         if disk:
             priority = _get_priority()
             _cached_nodes = sort_nodes_by_priority(disk, priority)
             proxy_state.set_nodes(_cached_nodes)
         else:
-            # 磁盘也没有：首次使用，必须联网
-            try:
-                raw_nodes = fetch_and_parse(SUB_URL)
-                _cached_nodes = raw_nodes
-                _save_nodes_to_disk(_cached_nodes)
-                proxy_state.set_nodes(_cached_nodes)
-                # 后台检测
-                if not _detect_status["running"]:
-                    t = threading.Thread(target=_run_country_detection_bg, args=(_cached_nodes,), daemon=True)
-                    t.start()
-            except Exception as e:
-                return JSONResponse({"error": str(e), "nodes": []}, status_code=502)
+            urls = _load_sub_urls()
+            raw_nodes = []
+            for url in urls:
+                try:
+                    raw_nodes.extend(fetch_and_parse(url))
+                except Exception:
+                    pass
+            if not raw_nodes:
+                return JSONResponse({"error": "拉取订阅失败，请检查订阅链接", "nodes": []}, status_code=502)
+            _cached_nodes = raw_nodes
+            _save_nodes_to_disk(_cached_nodes)
+            proxy_state.set_nodes(_cached_nodes)
+            if not _detect_status["running"]:
+                t = threading.Thread(target=_run_country_detection_bg, args=(_cached_nodes,), daemon=True)
+                t.start()
 
     safe = [{k: v for k, v in n.items() if k != "raw"} for n in _cached_nodes]
     return {"nodes": safe, "total": len(safe), "from_cache": not refresh,
@@ -448,6 +474,95 @@ async def custom_select(index: int):
             _save_active_node({"mode": "xray_custom", "index": index})
             return {"ok": True, "proxy": "socks5://127.0.0.1:1080", "node": node_name, "mode": "xray"}
         return JSONResponse({"ok": False, "error": err}, status_code=500)
+
+
+@router.get("/sub-urls")
+async def sub_urls_list():
+    return {"urls": _load_sub_urls()}
+
+
+@router.post("/sub-urls")
+async def sub_urls_add(request: Request):
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    if not url:
+        return JSONResponse({"ok": False, "error": "URL 不能为空"}, status_code=400)
+    urls = _load_sub_urls()
+    if url in urls:
+        return JSONResponse({"ok": False, "error": "该链接已存在"}, status_code=400)
+    urls.append(url)
+    _save_sub_urls(urls)
+    return {"ok": True, "urls": urls}
+
+
+@router.delete("/sub-urls/{index}")
+async def sub_urls_delete(index: int):
+    urls = _load_sub_urls()
+    if index < 0 or index >= len(urls):
+        return JSONResponse({"ok": False, "error": "索引无效"}, status_code=400)
+    removed = urls.pop(index)
+    _save_sub_urls(urls)
+    return {"ok": True, "removed": removed, "urls": urls}
+
+
+@router.post("/bench")
+async def bench_nodes():
+    """TCP ping 每个节点的 server:port，并发测速，结果存回 _cached_nodes[i]['latency_ms']"""
+    import asyncio
+    global _bench_running, _bench_results, _cached_nodes
+    if _bench_running:
+        return {"ok": False, "error": "测速正在进行中，请稍候"}
+    if not _cached_nodes:
+        return {"ok": False, "error": "节点列表为空，请先刷新订阅"}
+
+    _bench_running = True
+    _bench_results = {}
+    nodes_snap = list(_cached_nodes)
+
+    async def _tcp_ping(host: str, port: int, timeout: float = 5.0) -> int | None:
+        try:
+            t0 = asyncio.get_event_loop().time()
+            _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+            ms = int((asyncio.get_event_loop().time() - t0) * 1000)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return ms
+        except Exception:
+            return None
+
+    async def _run():
+        global _bench_running, _bench_results, _cached_nodes
+        try:
+            tasks = []
+            for i, n in enumerate(nodes_snap):
+                host = n.get("server") or n.get("address", "")
+                port = int(n.get("port", 443))
+                tasks.append(_tcp_ping(host, port))
+            results = await asyncio.gather(*tasks)
+            _bench_results = {i: r for i, r in enumerate(results)}
+            for i, n in enumerate(_cached_nodes):
+                if i < len(results):
+                    n["latency_ms"] = results[i]
+            # 测速完后按延迟重排（None 排最后）
+            def _sort_key(node):
+                lat = node.get("latency_ms")
+                return (0, lat) if lat is not None else (1, 9999)
+            _cached_nodes.sort(key=_sort_key)
+            _save_nodes_to_disk(_cached_nodes)
+            proxy_state.set_nodes(_cached_nodes)
+        finally:
+            _bench_running = False
+
+    asyncio.create_task(_run())
+    return {"ok": True, "total": len(nodes_snap), "message": f"正在测速 {len(nodes_snap)} 个节点，几秒后刷新列表查看结果"}
+
+
+@router.get("/bench-status")
+async def bench_status():
+    return {"running": _bench_running, "results": _bench_results}
 
 
 @router.get("/status")
@@ -700,14 +815,32 @@ textarea.input { font-family: monospace; font-size: 12px; resize: vertical; min-
     </div>
   </div>
 
+  <!-- 订阅链接管理 -->
+  <div class="card">
+    <div class="card-title">
+      <span>🔗 订阅链接管理</span>
+      <button class="btn btn-ghost btn-sm" onclick="loadSubUrls()">刷新</button>
+    </div>
+    <div id="sub-alert" class="alert"></div>
+    <div id="sub-url-list" style="margin-bottom:12px"><span class="loading">加载中…</span></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <input class="input" id="sub-url-input" placeholder="粘贴订阅链接，如 https://example.com/sub?token=xxx" style="flex:1;min-width:260px">
+      <button class="btn btn-success" onclick="addSubUrl()">＋ 添加</button>
+    </div>
+    <div class="hint" style="margin-top:8px">支持多条订阅链接，刷新节点时自动合并所有链接的节点</div>
+  </div>
+
   <!-- 订阅节点列表 -->
   <div class="card">
     <div class="card-title">订阅节点列表</div>
     <div id="alert-box" class="alert"></div>
     <div class="btn-row" style="margin-bottom:14px">
       <button class="btn btn-ghost" onclick="loadNodes(true)" id="btn-refresh">🔄 刷新节点列表</button>
+      <button class="btn btn-primary" onclick="startBench(this)" id="btn-bench">⚡ 一键测速排序</button>
+      <button class="btn btn-success" onclick="pickBest()" id="btn-best" style="display:none">🏆 选最优节点</button>
       <span class="lm" id="node-count"></span>
       <span id="detect-status" style="font-size:12px;color:#f59e0b;display:none">⏳ 正在检测出口国家…</span>
+      <span id="bench-status" style="font-size:12px;color:#f59e0b;display:none">⏳ 测速中…</span>
     </div>
     <div id="table-container"><span class="loading">点击"刷新节点列表"加载节点…</span></div>
   </div>
@@ -992,23 +1125,36 @@ function countryBadge(n) {
   return `<span style="font-size:12px">${flag} <span style="color:#64748b;font-size:11px">${colo}</span></span>`;
 }
 
+function latencyBadge(n) {
+  const ms = n.latency_ms;
+  if (ms === undefined || ms === null) return '<span class="lm" style="font-size:11px">-</span>';
+  const color = ms < 100 ? '#22c55e' : ms < 300 ? '#f59e0b' : '#ef4444';
+  return `<span style="color:${color};font-family:monospace;font-size:12px;font-weight:600">${ms}ms</span>`;
+}
+
 function renderTable() {
   if (!nodes.length) {
     document.getElementById('table-container').innerHTML = '<span class="loading">没有找到节点</span>';
     return;
   }
-  let html = '<table><thead><tr><th>#</th><th>国家</th><th>名称</th><th>地址</th><th>端口</th><th>协议</th><th>传输</th><th>操作</th></tr></thead><tbody>';
+  const hasBench = nodes.some(n => n.latency_ms !== undefined && n.latency_ms !== null);
+  const bestBtn = document.getElementById('btn-best');
+  bestBtn.style.display = hasBench ? 'inline-flex' : 'none';
+
+  let html = '<table><thead><tr><th>#</th><th>延迟</th><th>国家</th><th>名称</th><th>地址</th><th>端口</th><th>协议</th><th>操作</th></tr></thead><tbody>';
   nodes.forEach((n, i) => {
     const protoCls = n.protocol === 'vless' ? 'proto-vless' : 'proto-vmess';
-    const netTag = n.network && n.network !== 'tcp' ? `<span class="tag tag-ws">${n.network}</span>` : '<span class="lm">tcp</span>';
-    html += `<tr>
+    const isBest = hasBench && i === 0 && n.latency_ms !== null;
+    const rowStyle = isBest ? 'background:#14532d22;' : i === 1 && hasBench && n.latency_ms !== null ? 'background:#0c4a6e22;' : '';
+    const crown = isBest ? '👑 ' : '';
+    html += `<tr style="${rowStyle}">
       <td class="lm">${i+1}</td>
+      <td>${latencyBadge(n)}</td>
       <td>${countryBadge(n)}</td>
-      <td>${escHtml(n.name||'')}</td>
+      <td>${crown}${escHtml(n.name||'')}</td>
       <td style="font-family:monospace;font-size:12px">${escHtml((n.server||n.address||''))}</td>
       <td>${n.port}</td>
       <td><span class="proto-badge ${protoCls}">${(n.protocol||'').toUpperCase()}</span></td>
-      <td>${netTag}</td>
       <td><button class="btn btn-success btn-sm" onclick="selectNode(${i})">选择</button></td>
     </tr>`;
   });
@@ -1034,6 +1180,95 @@ async function selectNode(i) {
   }
 }
 
+// ── 订阅链接管理 ──────────────────────────────────────────────────────────────
+
+async function loadSubUrls() {
+  try {
+    const d = await api('/sub-urls');
+    const urls = d.urls || [];
+    const el = document.getElementById('sub-url-list');
+    if (!urls.length) {
+      el.innerHTML = '<div class="empty-state">还没有订阅链接</div>';
+      return;
+    }
+    el.innerHTML = urls.map((u, i) => `
+      <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid #1e3a5f;flex-wrap:wrap">
+        <span style="color:#64748b;font-size:12px;min-width:20px">${i+1}</span>
+        <span style="font-family:monospace;font-size:12px;color:#7dd3fc;flex:1;word-break:break-all">${escHtml(u)}</span>
+        <button class="btn btn-warn btn-sm" onclick="deleteSubUrl(${i})">删除</button>
+      </div>
+    `).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function addSubUrl() {
+  const url = document.getElementById('sub-url-input').value.trim();
+  if (!url) { showAlert('请粘贴订阅链接', 'error', 'sub-alert'); return; }
+  const d = await api('/sub-urls', { method: 'POST', body: JSON.stringify({ url }) });
+  if (d.ok) {
+    showAlert('✅ 已添加订阅链接', 'success', 'sub-alert');
+    document.getElementById('sub-url-input').value = '';
+    await loadSubUrls();
+  } else {
+    showAlert('添加失败: ' + d.error, 'error', 'sub-alert');
+  }
+}
+
+async function deleteSubUrl(i) {
+  if (!confirm('确认删除该订阅链接？')) return;
+  const d = await api(`/sub-urls/${i}`, { method: 'DELETE' });
+  if (d.ok) {
+    showAlert('已删除', 'success', 'sub-alert');
+    await loadSubUrls();
+  } else {
+    showAlert('删除失败: ' + d.error, 'error', 'sub-alert');
+  }
+}
+
+// ── 测速 ──────────────────────────────────────────────────────────────────────
+
+let benchPollTimer = null;
+
+async function startBench(btn) {
+  if (!nodes.length) { showAlert('请先刷新节点列表', 'error'); return; }
+  btn.disabled = true; btn.textContent = '测速中…';
+  const bsEl = document.getElementById('bench-status');
+  bsEl.style.display = 'inline'; bsEl.style.color = '#f59e0b';
+  bsEl.textContent = `⏳ 正在测速 ${nodes.length} 个节点…`;
+  try {
+    const d = await api('/bench', { method: 'POST', body: '{}' });
+    if (!d.ok) { showAlert('测速失败: ' + d.error); return; }
+    if (benchPollTimer) clearInterval(benchPollTimer);
+    benchPollTimer = setInterval(pollBenchStatus, 1500);
+  } catch(e) {
+    showAlert('测速请求失败: ' + e);
+  } finally {
+    btn.disabled = false; btn.textContent = '⚡ 一键测速排序';
+  }
+}
+
+async function pollBenchStatus() {
+  try {
+    const d = await api('/bench-status');
+    const bsEl = document.getElementById('bench-status');
+    if (!d.running) {
+      clearInterval(benchPollTimer); benchPollTimer = null;
+      bsEl.style.color = '#22c55e';
+      bsEl.textContent = '✅ 测速完成，已按延迟排序';
+      await loadNodes();
+    }
+  } catch(e) {}
+}
+
+async function pickBest() {
+  if (!nodes.length) return;
+  const best = nodes.find(n => n.latency_ms !== null && n.latency_ms !== undefined);
+  if (!best) { showAlert('没有可用节点（全部超时）', 'error'); return; }
+  const idx = nodes.indexOf(best);
+  showAlert(`正在选择最优节点: 👑 ${best.name} (${best.latency_ms}ms)…`, 'success');
+  await selectNode(idx);
+}
+
 // ── 日志 ──────────────────────────────────────────────────────────────────────
 
 async function loadLogs() {
@@ -1049,6 +1284,7 @@ async function loadLogs() {
 
 loadStatus();
 loadCustom();
+loadSubUrls();
 loadLogs();
 loadSettings();
 setInterval(loadStatus, 8000);
