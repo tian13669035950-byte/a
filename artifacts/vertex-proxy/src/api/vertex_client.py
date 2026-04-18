@@ -198,6 +198,27 @@ class VertexAIClient:
             logger.success(f"流式响应处理完成，共处理 {chunk_count} 个数据块")
             return
 
+    @staticmethod
+    def _extract_text_from_sse_chunks(chunks: list[str]) -> str:
+        """从 SSE chunk 列表中提取实际文字内容"""
+        text_parts: list[str] = []
+        for chunk_str in chunks:
+            actual = chunk_str.strip()
+            if actual.startswith("data: "):
+                actual = actual[6:]
+            if not actual:
+                continue
+            try:
+                obj = json.loads(actual)
+                for candidate in obj.get("candidates", []):
+                    content = candidate.get("content", {})
+                    for part in content.get("parts", []):
+                        if isinstance(part, dict) and "text" in part and not part.get("thought"):
+                            text_parts.append(part["text"])
+            except Exception:
+                pass
+        return "".join(text_parts)
+
     async def _stream_chat_inner(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[str, Any]:
         """实际的流式聊天逻辑（内部方法）"""
         max_retries = self.max_retries
@@ -231,11 +252,35 @@ class VertexAIClient:
                 logger.debug(f"尝试第 {attempt + 1}/{max_retries + 1} 次正式请求 {'(首次认证重试)' if is_first_auth_attempt else ''}")
                 
                 try:
-                    # 2. 执行请求
+                    # 2. 先缓冲本次响应，确认有实际文字内容再发给客户端
+                    buffered_chunks: list[str] = []
                     async for chunk in self._execute_single_attempt(
                         session, model, gemini_payload, recaptcha_token, attempt, kwargs,
                         is_first_auth_attempt=is_first_auth_attempt
                     ):
+                        buffered_chunks.append(chunk)
+
+                    # 3. 检查是否有真实文字内容
+                    actual_text = self._extract_text_from_sse_chunks(buffered_chunks)
+                    if not actual_text.strip() and attempt < max_retries:
+                        logger.warning(f"收到空回复（无文字内容），自动重试（第 {attempt + 1} 次）")
+                        # 尝试换一个代理节点再试
+                        try:
+                            from proxy_manager import proxy_state as _ps
+                            if _ps.get_node_count() > 1:
+                                if _ps.rotate_to_next():
+                                    logger.info("空回复，已自动切换到下一个代理节点")
+                                    await asyncio.sleep(2)
+                        except Exception:
+                            pass
+                        recaptcha_token = None  # 强制重新拿 token
+                        attempt += 1
+                        continue
+
+                    # 4. 有内容（或已到重试上限）→ 全部发给客户端
+                    if not actual_text.strip():
+                        logger.warning(f"重试耗尽，仍为空回复，原样发送（模型={model}）")
+                    for chunk in buffered_chunks:
                         yield chunk
                         content_yielded = True
                     
