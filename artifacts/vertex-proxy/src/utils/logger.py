@@ -9,6 +9,7 @@ Vertex AI Proxy 日志系统
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import os
 import json
@@ -174,7 +175,7 @@ class LoggerManager:
         if log_file:
             os.makedirs(os.path.dirname(log_file), exist_ok=True)
             # 使用 'w' 模式在每次启动时清空日志文件
-            file_h = logging.FileHandler(log_file, mode='w', encoding='utf-8', delay=False)
+            file_h = RotatingFileHandler(log_file, maxBytes=2*1024*1024, backupCount=3, encoding='utf-8', delay=False)
             file_h.setFormatter(BetterFormatter(use_colors=False))
             file_h.setLevel(self._log_level)
             # 立即刷新，确保日志写入

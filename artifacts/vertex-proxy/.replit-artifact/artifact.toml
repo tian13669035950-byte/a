@@ -9,7 +9,7 @@ name = "Vertex AI Proxy"
 paths = ["/"]
 
 [services.development]
-run = "cd artifacts/vertex-proxy && PORT=8000 python3 main.py"
+run = "PORT=8000 python3 main.py"
 
 [services.production]
 

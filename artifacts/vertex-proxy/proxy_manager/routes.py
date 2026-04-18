@@ -12,9 +12,29 @@ from .xray_manager import start_xray, start_xray_from_outbounds, stop_xray, is_r
 from . import proxy_state
 from .country_detect import detect_all, sort_nodes_by_priority, DEFAULT_COUNTRY_PRIORITY, COUNTRY_NAMES
 
-router = APIRouter(prefix="/proxy-manager", tags=["proxy-manager"])
+import secrets as _secrets
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
-SUB_URL = "https://tian110110.us.ci/sub?token=e2fb1e6322ce2a3d02e0d28de5846ea6"
+_admin_security = HTTPBasic(auto_error=False)
+
+def _admin_auth(creds: HTTPBasicCredentials | None = Depends(_admin_security)):
+    """管理界面访问控制：设置 ADMIN_PASSWORD 环境变量后启用 HTTP Basic 认证"""
+    expected = os.environ.get("ADMIN_PASSWORD", "").strip()
+    if not expected:
+        # 未设置密码：放行（开发环境）
+        return
+    if creds is None or not _secrets.compare_digest(creds.password, expected):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="需要管理员密码",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+router = APIRouter(prefix="/proxy-manager", tags=["proxy-manager"], dependencies=[Depends(_admin_auth)])
+
+_DEFAULT_SUB_URL = "https://tian110110.us.ci/sub?token=e2fb1e6322ce2a3d02e0d28de5846ea6"
+SUB_URL = os.environ.get("SUB_URL", "").strip() or _DEFAULT_SUB_URL
 _cached_nodes: list = []
 _detect_status: dict = {"running": False, "done": 0, "total": 0, "last_run": ""}
 
