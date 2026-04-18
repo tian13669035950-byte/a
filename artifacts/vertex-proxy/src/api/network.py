@@ -147,6 +147,10 @@ class FakeResponse:
         async for line in self._resp.aiter_lines():
             yield line.encode("utf-8") if isinstance(line, str) else line
 
+    def json(self):
+        import json as _json
+        return _json.loads(self._resp.text)
+
 
 class HttpxStreamingFakeResponse:
     """httpx 真流式响应封装，aiter_lines() 边收边发，不缓冲整体"""
@@ -165,6 +169,14 @@ class HttpxStreamingFakeResponse:
     async def aiter_lines(self):
         async for line in self._resp.aiter_lines():
             yield line.encode("utf-8") if isinstance(line, str) else line
+
+    def json(self):
+        import json as _json
+        # token_counter 用法是非流式 POST 后立刻调 .json()，此时 _resp 已读完
+        try:
+            return self._resp.json()
+        except Exception:
+            return _json.loads(self._resp.text)
 
 
 class MockSession:

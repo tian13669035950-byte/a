@@ -62,11 +62,8 @@ def rotate_to_next() -> bool:
     if not _nodes:
         return False
 
-    if _scanning:
-        # 节点扫描进行时，主请求不要换 xray，否则会杀死扫描连接
-        return False
-
-    # 加锁串行化，避免并发请求同时调用 start_xray
+    # 注意：扫描期间也允许主请求 rotate（之前禁用导致用户请求只能死磕同一节点）
+    # 仅靠 _xray_lock 串行化即可，扫描会让位给主请求
     with _xray_lock:
         next_index = (_current_index + 1) % len(_nodes)
         from .xray_manager import start_xray
