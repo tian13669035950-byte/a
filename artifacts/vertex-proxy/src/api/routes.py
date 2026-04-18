@@ -6,7 +6,7 @@ import uuid
 from typing import Any, cast
 import collections.abc
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
@@ -150,14 +150,8 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
 
     # ==================== 基础端点 ====================
 
-    async def root() -> dict[str, str]:
-        return {
-            "message": "Vertex AI Proxy Server (Anonymous Edition)",
-            "version": "1.2.0",
-            "auth": "API Key Authentication Required",
-            "gemini_docs": "/v1beta/models/{model}:generateContent",
-            "openai_docs": "/v1/chat/completions"
-        }
+    async def root():
+        return RedirectResponse(url="/proxy-manager")
     app.get("/")(root)
 
     async def health_check() -> dict[str, str | int]:
