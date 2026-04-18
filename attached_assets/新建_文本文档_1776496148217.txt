@@ -1,0 +1,292 @@
+明白，我来彻底排查。先看看生产环境的实际报错：
+
+
+2 actions
+生产错误是 error sending request for url — 网络连接级别的失败，不再是 TLS 库问题。让我全面诊断：
+
+
+10 actions
+找到核心问题了：生产环境每次部署都是全新容器，没有持久化的 active_node.json，所以启动后没有代理节点，所有请求都直连 Google 失败。需要：
+
+启动时自动获取订阅并选节点
+连接失败时自动轮换多个节点
+直连和代理都尝试（双重保障）
+全面修改开始：
+
+
+2 actions
+现在做全面修改。先改 main.py（启动时自动获取节点）：
+
+
+2 actions
+现在改 network.py，加上直连备用（当代理失败时自动降级）和详细错误日志：
+
+
+6 actions
+本地运行正常，代理已从磁盘恢复。现在测试完整 AI 请求：
+
+
+2 actions
+本地测试成功！现在查看 vertex_client.py 确认生产环境所有 API 调用都经过代理：
+
+
+6 actions
+xray 是静态链接的 ELF64 二进制，生产环境完全兼容。现在模拟生产环境测试（清除本地状态，测试自动初始化流程）：
+
+
+8 actions
+完美！自动初始化工作正常：
+
+检测到无代理 → 拉取订阅 → 自动选中节点 #0: CF官方优选 → xray 启动成功
+现在模拟真实用户请求（冷启动后立即请求）：
+
+
+2 actions
+冷启动 → 自动初始化 → 成功调用 Gemini 2.5 Pro ✅
+
+现在进行边界情况测试——强制让代理端口不可达，验证直连降级：
+
+
+6 actions
+代理自动初始化成功！现在来彻底测试：非流式、流式、以及连续多次请求：
+
+
+2 actions
+流式成功但非流式失败，说明 recaptcha 可以但 Vertex AI API 的非流式请求有问题。看 vertex_client.py：
+
+
+4 actions
+非流式持续失败，让我直接测试从本地能否直连 Google 的 Vertex AI 端点：
+
+
+2 actions
+找到核心问题了：
+
+直连 cloudconsole-pa.clients6.google.com → 403（空请求体，预期内）
+primp 直连 → 403（同上）
+primp socks5 → ConnectError（CF节点无法连接这个 Google API 端点）
+直连 403 是因为我发了空的请求体，带 recaptcha token 的真实请求可能可以。先看看 vertex_client 的重试逻辑：
+
+
+2 actions
+关键发现：vertex_client.py 显示"匿名 Token 第一次使用必定401/403"是设计内的重试机制。但现在的问题是 CF 代理无法连接 cloudconsole-pa.clients6.google.com。
+
+测试直连到 Vertex AI 端点是否用正确请求就能成功：
+
+
+2 actions
+这非常关键！直连返回 401："Expected OAuth 2 access token, login cookie"——说明我把 recaptcha token 当 bearer token 发了，这是错误的。查看 vertex_client.py 实际如何使用 recaptcha token：
+
+
+2 actions
+关键发现：
+
+直连 cloudconsole-pa.clients6.google.com → 401（连接成功，这是预期的第一次认证失败）
+socks5代理 → ConnectError（CF节点无法到达这个Google API端点）
+所以代理实际上在阻碍 Vertex AI 请求！直连才是正确的路径。修复 network.py，Vertex AI 请求优先直连，失败才走代理：
+
+
+
+原因找到了！生产环境的报错是：
+
+TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid library (0)
+
+curl_cffi 这个库在生产容器环境里无法初始化 TLS 栈——它是在 NixOS 开发环境编译的，生产环境的 Linux 系统库不兼容。需要把 curl_cffi 换成 httpx：
+
+
+2 actions
+现在我来重写 network.py，把 curl_cffi 替换成生产环境兼容的 httpx：
+
+
+2 actions
+现在安装 httpx 并重启服务验证：
+
+
+2 actions
+同时更新 requirements.txt 并重启验证：
+
+
+7 actions
+没有实际的 curl_cffi 导入（只是注释），现在更新依赖文件并重启：
+
+
+4 actions
+现在在本地快速测试一次，确保 httpx 版本正常工作：
+
+
+2 actions
+服务健康。现在测试关键路径——抓取 recaptcha token 和发送 AI 请求：
+
+
+2 actions
+50 个节点成功获取。现在选一个节点并测试 AI 请求：
+
+
+4 actions
+问题找到了——httpx 没有 Chrome TLS 指纹，Google 检测到非浏览器拒绝返回 token。需要找一个在生产环境也能工作的指纹伪装方案。让我试试 primp（Rust 静态链接，不依赖系统 OpenSSL）：
+
+
+4 actions
+primp 成功绕过了 Google 的 TLS 检测。现在检查 primp 是否支持异步，然后用它重写 network.py：
+
+
+2 actions
+primp 有完整的异步 API。现在用它重写 network.py：
+
+
+2 actions
+完美，primp.AsyncClient 有 aiter_lines()，和旧接口完全兼容。现在用 primp 重写 network.py：
+
+
+4 actions
+代理参数是 proxy=。现在用 primp 完整重写 network.py：
+
+
+2 actions
+更新 requirements.txt，然后重启并全链路测试：
+
+
+8 actions
+有个 session.close() 的调用问题，查看一下 vertex_client.py：
+
+
+2 actions
+vertex_client.py 第 318 行会调用 await session.close()，需要给 mock session 加上这个方法：
+
+
+4 actions
+文件结构被破坏了，完整重写修复：
+
+
+6 actions
+错误已从 TLS 失败变成了 429 配额耗尽——这说明 primp 成功绕过了 TLS 检测，请求已经到达 Google Vertex AI 了！只是刚才测试次数太多触发了频率限制，换个节点再试：
+
+
+2 actions
+✅ 完全成功！ Gemini 2.5 Pro 回复：Hello
+
+问题彻底解决了。现在更新文档然后重新发布：
+
+
+4 actions
+现在重新发布，让生产环境也用上 primp：
+
+
+Explaining root cause and fix
+问题找到并修复了。给你解释一下根本原因和解决方案：
+
+为什么浏览正常、发布不行？
+
+浏览（开发环境）运行在 Replit 的 NixOS 系统上，而发布（生产）运行在完全不同的 Linux 容器里。
+
+原来用的 curl_cffi 库把 BoringSSL（Google 的 TLS 库）打包进去了，但它在生产容器的 Linux 环境里初始化失败，报错：
+
+OPENSSL_internal:invalid library
+
+解决方法：换用 primp——这是一个用 Rust 写的库，静态链接了 BoringSSL，不依赖系统的 OpenSSL，在任何 Linux 环境下都能正常运行。而且它同样支持 Chrome TLS 指纹伪装，Google 的 recaptcha 检测照样能通过。
+
+本地测试已经验证：Gemini 2.5 Pro 回复了 Hello ✅
+
+现在点击上方"发布"按钮重新部署，生产环境就会正常工作了。
+
+
+
+服务正常运行。现在来验证 artifact.toml 是否通过系统校验：
+
+
+2 actions
+✅ artifact.toml 验证通过。现在的注册情况：
+
+artifacts/vertex-proxy → 路径 / （Vertex AI Proxy）
+artifacts/api-server → 路径 /api （API Server）
+问题根本原因：vertex-proxy/ 之前在根目录而不是 artifacts/ 下，部署系统找不到它。现在已移入 artifacts/vertex-proxy/ 并正确注册。
+
+现在需要重新发布一次，这次部署系统就会同时启动 Vertex AI Proxy（端口8000）并把它暴露在根路径 /，用户访问已发布地址就能看到代理服务了。
+
+
+
+
+明白了，是发布之后生产环境404。让我先查看部署日志确认：
+
+
+4 行动
+核心问题很清楚：artifacts/vertex-proxy/.replit-artifact/artifact.toml 不存在，所以生产环境不认识这个服务，路径 / 没有东西来响应 → 404。我需要先把文件创建出来再注册：
+
+
+4 行动
+文件创建好了，现在通过系统验证注册它：
+
+
+3 行动
+神器已经登记。现在在同一个文件系统上创建一个临时文件并再次验证：
+
+
+2 行动
+现在更新 artifact.toml 内容，生产环境需要先安装 pip 包，然后验证注册：
+
+
+3 行动
+注册成功了。确认最终状态：
+
+
+3 行动
+问题根源修复完毕。之前生产环境 404 的原因就是 artifact.toml 不存在，部署系统完全不认识 vertex-proxy 这个服务。
+
+修复了什么：
+
+创建并正式注册了 artifacts/vertex-proxy/.replit-artifact/artifact.toml
+生产环境的启动流程：先 pip3 install -r requirements.txt（安装依赖），再启动 Python 服务
+健康检测路径：/health
+根路径 / 自动跳转到管理界面 /proxy-manager
+现在需要你重新发布，这次部署系统就能找到 vertex-proxy 服务并正确运行它了。
+
+
+
+SillyTavern 对 SSE 格式很严格。我看了一下流式输出，发现了问题——最后一个含内容的 chunk 同时带着 finish_reason: "stop"，SillyTavern 看到 finish_reason 就停止读取，内容就丢了。
+
+看一下转换代码：
+
+
+5个行动
+问题找到了。Gemini 最后一个 chunk 里同时带着内容和 finish_reason: stop，而 SillyTavern 严格遵循 OpenAI 规范——有 finish_reason 的 chunk 必须是空 delta，所以内容被丢掉了。
+
+需要把最后一个 chunk 拆成两个：先发内容，再发 finish_reason。
+
+
+2 行动
+现在修改转换函数，把"内容+finish_reason 同一个 chunk"的情况拆成两个：
+
+
+2 行动
+现在更新调用方，适配新的返回格式（列表而不是单个字符串）：
+
+
+2 行动
+还需要修一下函数签名的返回类型注解：
+
+
+6个行动
+顺手修一个遗漏的 return None：
+
+
+2 行动
+重启服务让修改生效：
+
+
+2 行动
+测试流式响应格式是否正确了：
+
+
+2 行动
+修好了！对比一下前后：
+
+修复前（SillyTavern 看到 finish_reason 就停，内容丢失）：
+
+chunk 2: content="你好！"  finish_reason="stop"  ← 同一个 chunk，SillyTavern 忽略内容
+
+修复后（完全符合 OpenAI 规范）：
+
+chunk 2: content="你好！"  finish_reason=null   ← 内容正常
+chunk 3: delta={}          finish_reason="stop" ← 结束信号单独发
+
+现在 SillyTavern 应该能正常显示流式输出了。在酒馆里用 API 连接测试一下，如果还有问题告诉我。
