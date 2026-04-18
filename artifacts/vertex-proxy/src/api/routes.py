@@ -324,6 +324,24 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
 
     app.post("/v1/chat/completions", response_model=None)(openai_chat_completions)
 
+    # 探活：部分 OpenAI 兼容客户端会 GET /v1/chat/completions 当健康检查
+    # 官方接口返 405 会被这些客户端误判成"端点失效"，所以改成返回 200 OK
+    async def chat_completions_probe() -> dict[str, Any]:
+        return {
+            "object": "endpoint",
+            "status": "ok",
+            "message": "OpenAI-compatible chat completions endpoint. Send a POST request to use it.",
+            "methods": ["POST"],
+        }
+    app.get("/v1/chat/completions")(chat_completions_probe)
+    app.head("/v1/chat/completions")(chat_completions_probe)
+
+    # Gemini 端点同理
+    async def gemini_probe(model: str) -> dict[str, Any]:
+        return {"object": "endpoint", "status": "ok", "model": model, "methods": ["POST"]}
+    app.get("/v1beta/models/{model}:generateContent")(gemini_probe)
+    app.get("/v1beta/models/{model}:streamGenerateContent")(gemini_probe)
+
     logger.info("FastAPI 应用创建完成")
     return app
 
