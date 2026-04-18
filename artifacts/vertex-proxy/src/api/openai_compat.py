@@ -221,12 +221,16 @@ def gemini_response_to_openai(gemini_resp: dict[str, Any], model: str, stream: b
             if "text" in part and not part.get("thought"):
                 text_parts.append(part["text"])
             if "functionCall" in part:
-                fc = part["functionCall"]
+                fc = part["functionCall"] or {}
+                fc_name = fc.get("name") or ""
+                # 过滤上游 thinking 模式产生的空 functionCall（name 为空 → 不是真工具调用）
+                if not fc_name:
+                    continue
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:16]}",
                     "type": "function",
                     "function": {
-                        "name": fc.get("name", ""),
+                        "name": fc_name,
                         "arguments": json.dumps(fc.get("args", {}), ensure_ascii=False)
                     }
                 })
@@ -327,12 +331,16 @@ def gemini_sse_chunk_to_openai(
             if "text" in part and not part.get("thought"):
                 text_parts.append(part["text"])
             if "functionCall" in part:
-                fc = part["functionCall"]
+                fc = part["functionCall"] or {}
+                fc_name = fc.get("name") or ""
+                # 过滤上游 thinking 模式产生的空 functionCall（name 为空 → 不是真工具调用）
+                if not fc_name:
+                    continue
                 tool_calls.append({
                     "id": f"call_{uuid.uuid4().hex[:16]}",
                     "type": "function",
                     "function": {
-                        "name": fc.get("name", ""),
+                        "name": fc_name,
                         "arguments": json.dumps(fc.get("args", {}), ensure_ascii=False)
                     }
                 })
@@ -398,6 +406,34 @@ def gemini_sse_chunk_to_openai(
         results.append(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
 
     return results
+
+
+def convert_realtime_chunk(
+    gemini_chunk: dict[str, Any],
+    model: str,
+    completion_id: str,
+    created: int,
+    is_first: bool = False,
+) -> list[str]:
+    """
+    将单个 Gemini dict chunk 转换为一组 OpenAI SSE 行。
+    is_first=True 时在前面插入角色声明 chunk。
+    """
+    out: list[str] = []
+    if is_first:
+        first = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
+            "system_fingerprint": None,
+        }
+        out.append(f"data: {json.dumps(first, ensure_ascii=False)}\n\n")
+
+    # 直接复用现成的 SSE 转换函数
+    out.extend(gemini_sse_chunk_to_openai(gemini_chunk, model, completion_id, created))
+    return out
 
 
 async def stream_gemini_as_openai(

@@ -11,6 +11,7 @@ from src.core.errors import (
     AuthenticationError,
     RateLimitError,
     InternalError,
+    EmptyResponseError,
     parse_error_response,
     raise_for_status,
 )
@@ -99,9 +100,15 @@ class VertexAIClient:
         )
 
     async def stream_chat(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[str, Any]:
-        """流式聊天"""
+        """流式聊天（聚合后单 chunk 输出，兼容老路径）"""
         logger.info(f"开始流式聊天请求: 模型={model}")
         async for chunk in self._stream_chat_inner(model, gemini_payload=gemini_payload, **kwargs):
+            yield chunk
+
+    async def stream_chat_realtime(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+        """真流式聊天：逐 result 块 yield Gemini 格式 dict（不聚合）"""
+        logger.info(f"开始真流式聊天请求: 模型={model}")
+        async for chunk in self._stream_realtime_inner(model, gemini_payload=gemini_payload, **kwargs):
             yield chunk
 
     async def _execute_single_attempt(
@@ -257,6 +264,255 @@ class VertexAIClient:
             except Exception:
                 pass
         return "".join(text_parts)
+
+    @staticmethod
+    def _extract_text_from_dict_chunks(chunks: list[dict[str, Any]]) -> str:
+        """从 Gemini dict chunk 列表中提取文字内容（用于真流式空回复检测）"""
+        out: list[str] = []
+        for chunk in chunks:
+            for cand in chunk.get("candidates", []) or []:
+                content = cand.get("content", {}) or {}
+                for part in content.get("parts", []) or []:
+                    if isinstance(part, dict) and "text" in part and not part.get("thought"):
+                        out.append(part["text"])
+        return "".join(out)
+
+    async def _process_streaming_object(self, obj: dict[str, Any]) -> AsyncGenerator[dict[str, Any], None]:
+        """从单个上游 JSON 对象提取增量 Gemini chunk"""
+        results = obj.get("results", []) or []
+        for result in results:
+            errors = result.get("errors")
+            if errors and isinstance(errors, list) and len(errors) > 0:
+                first_err = errors[0] if isinstance(errors[0], dict) else {"message": str(errors[0])}
+                err_msg = first_err.get("message", "")
+                if "Failed to verify action" in err_msg or "The caller does not have permission" in err_msg:
+                    raise AuthenticationError(message=err_msg, upstream_response=err_msg)
+                parsed = parse_error_response({"errors": errors})
+                if parsed:
+                    raise parsed
+
+            data = result.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            ui = data.get("ui", {})
+            if isinstance(ui, dict) and "streamGenerateContentAnonymous" in ui:
+                inner = ui["streamGenerateContentAnonymous"]
+                if isinstance(inner, dict):
+                    data = inner
+                elif isinstance(inner, list):
+                    for item in inner:
+                        if isinstance(item, dict) and item.get("candidates"):
+                            yield item
+                    continue
+                else:
+                    continue
+
+            candidates = data.get("candidates", [])
+            if candidates:
+                chunk: dict[str, Any] = {"candidates": candidates}
+                if data.get("usageMetadata"):
+                    chunk["usageMetadata"] = data["usageMetadata"]
+                if data.get("modelVersion"):
+                    chunk["modelVersion"] = data["modelVersion"]
+                if data.get("responseId"):
+                    chunk["responseId"] = data["responseId"]
+                yield chunk
+
+    async def _execute_realtime_attempt(
+        self,
+        session: Any,
+        model: str,
+        gemini_payload: dict[str, Any],
+        recaptcha_token: str,
+        attempt: int,
+        kwargs: dict[str, Any],
+        is_first_auth_attempt: bool = False
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """真流式：执行单次请求，按 result 块 yield Gemini dict"""
+        # 构建 payload，逻辑与 _execute_single_attempt 完全一致
+        dummy_original_body = {"variables": {}}
+        new_variables = self.transformer.build_vertex_payload(
+            model=model,
+            gemini_payload=gemini_payload,
+            original_body=dummy_original_body,
+            kwargs=kwargs
+        )['variables']
+        new_variables["region"] = "global"
+        new_variables["recaptchaToken"] = recaptcha_token
+
+        new_body = {
+            "querySignature": "2/l8eCsMMY49imcDQ/lwwXyL8cYtTjxZBF2dNqy69LodY=",
+            "operationName": "StreamGenerateContentAnonymous",
+            "variables": new_variables,
+        }
+
+        # 也注入 stream_processor 的请求上下文（保留 token 计数能力）
+        downstream_payload: dict[str, Any] = {
+            "model": model,
+            "gemini_payload": gemini_payload,
+            "kwargs": {k: v for k, v in kwargs.items() if k != 'tools'},
+            "attempt": attempt,
+            "instance_id": "anonymous"
+        }
+        get_stream_processor().set_request_context(downstream_payload, new_body)
+
+        headers = {
+            "referer": "https://console.cloud.google.com/",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.vertex_ai_anonymous_base_api}/v3/entityServices/AiplatformEntityService/schemas/AIPLATFORM_GRAPHQL:batchGraphql?key=AIzaSyCI-zsRP85UVOi0DjtiCwWBwQ1djDy741g&prettyPrint=false"
+
+        if attempt > 0 or not is_first_auth_attempt:
+            logger.debug_json("发送 Vertex AI 请求体（真流式）", new_body)
+
+        # 收集上游字节（上游一次性返回 JSON 数组），完成后逐 result yield
+        async for response in self.network.stream_request(session, 'POST', url, headers=headers, json_data=new_body):
+            if response.status_code != 200:
+                error_text = await response.aread()
+                error_text_str = error_text.decode() if error_text else ""
+                if is_first_auth_attempt and (response.status_code in [401, 403] or "Failed to verify action" in error_text_str):
+                    logger.debug(f"真流式：预期内首次认证失败 HTTP {response.status_code}")
+                else:
+                    logger.error(f"真流式：上游错误 HTTP {response.status_code}")
+                    logger.debug_large("完整上游错误响应", error_text_str)
+
+                if response.status_code in [401, 403] or "Failed to verify action" in error_text_str or "The caller does not have permission" in error_text_str:
+                    raise AuthenticationError(
+                        message=f"Authentication/Recaptcha failed: {error_text_str}",
+                        details={"upstream_response": error_text_str},
+                        upstream_response=error_text_str
+                    )
+                parsed_error = parse_error_response(error_text_str)
+                if parsed_error:
+                    parsed_error.upstream_response = error_text_str
+                    raise parsed_error
+                raise raise_for_status(
+                    code=response.status_code,
+                    message=f"Upstream Error: {error_text_str}",
+                    upstream_response=error_text_str
+                )
+
+            raw_chunks: list[str] = []
+            async for line in response.aiter_lines():
+                decoded = line.decode('utf-8') if isinstance(line, bytes) else line
+                raw_chunks.append(decoded)
+            raw_data = '\n'.join(raw_chunks)
+
+            if not raw_data:
+                raise EmptyResponseError("Upstream returned no data (realtime)")
+
+            try:
+                data_list = json.loads(raw_data)
+                if not isinstance(data_list, list):
+                    data_list = [data_list]
+            except json.JSONDecodeError:
+                logger.warning("真流式：JSON 解析失败，尝试容错")
+                data_list = []
+
+            logger.debug(f"真流式：解析到 {len(data_list)} 个顶层对象")
+            for obj in data_list:
+                if isinstance(obj, dict):
+                    async for chunk in self._process_streaming_object(obj):
+                        yield chunk
+            return
+
+    async def _stream_realtime_inner(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+        """真流式内部循环（含重试 / 节点切换 / 首次 401 重试），与 _stream_chat_inner 同构"""
+        max_retries = self.max_retries
+        content_yielded = False
+        recaptcha_token = None
+        is_first_auth_attempt = True
+        attempt = 0
+
+        session = self.network.create_session()
+        try:
+            while attempt <= max_retries:
+                if not recaptcha_token:
+                    recaptcha_token = await self.network.fetch_recaptcha_token(session)
+                    is_first_auth_attempt = True
+
+                if not recaptcha_token:
+                    if attempt == max_retries:
+                        raise AuthenticationError("Could not fetch recaptcha token.")
+                    attempt += 1
+                    await asyncio.sleep(1)
+                    continue
+
+                logger.debug(f"真流式：第 {attempt + 1}/{max_retries + 1} 次尝试 {'(首次认证)' if is_first_auth_attempt else ''}")
+
+                try:
+                    # 先收一遍判断是否空回复
+                    buffered: list[dict[str, Any]] = []
+                    async for ch in self._execute_realtime_attempt(
+                        session, model, gemini_payload, recaptcha_token, attempt, kwargs,
+                        is_first_auth_attempt=is_first_auth_attempt
+                    ):
+                        buffered.append(ch)
+
+                    actual_text = self._extract_text_from_dict_chunks(buffered)
+                    if not actual_text.strip() and attempt < max_retries:
+                        logger.warning(f"真流式：空回复，自动重试（第 {attempt + 1} 次）")
+                        switched = await self._rotate_with_refresh()
+                        if switched:
+                            logger.info("真流式：已自动切换到下一个代理节点")
+                            await asyncio.sleep(2)
+                        recaptcha_token = None
+                        attempt += 1
+                        continue
+
+                    if not actual_text.strip():
+                        logger.warning(f"真流式：重试耗尽仍空，原样发送（模型={model}）")
+
+                    for ch in buffered:
+                        yield ch
+                        content_yielded = True
+                    break
+
+                except AuthenticationError as e:
+                    if is_first_auth_attempt:
+                        logger.debug("真流式：首次 401/403 重试")
+                        is_first_auth_attempt = False
+                        await asyncio.sleep(0.5)
+                        continue
+                    logger.warning(f"真流式：认证错误 {e.message}")
+                    recaptcha_token = None
+                    if content_yielded or attempt >= max_retries:
+                        raise
+                    attempt += 1
+                    await asyncio.sleep(1)
+                    continue
+
+                except RateLimitError as e:
+                    logger.warning(f"真流式：限流 {e.message}")
+                    if content_yielded or attempt >= max_retries:
+                        raise
+                    rotated = await self._rotate_with_refresh()
+                    wait_time = 3 if rotated else (e.retry_after if e.retry_after else min(30, 2 ** attempt + 1))
+                    logger.info(f"真流式：等待 {wait_time}s 后重试")
+                    attempt += 1
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                except VertexError as e:
+                    logger.error(f"真流式：Vertex 错误 {e.message}")
+                    if not e.is_retryable or content_yielded or attempt >= max_retries:
+                        raise
+                    wait_time = min(15, 1.5 ** attempt)
+                    logger.info(f"真流式：可重试错误，等待 {wait_time:.1f}s")
+                    attempt += 1
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                except Exception as e:
+                    logger.error(f"真流式：未预期异常 {e}")
+                    if content_yielded or attempt >= max_retries:
+                        raise InternalError(message=f"Internal error: {e}")
+                    attempt += 1
+                    await asyncio.sleep(1)
+                    continue
+        finally:
+            await session.close()
 
     async def _stream_chat_inner(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[str, Any]:
         """实际的流式聊天逻辑（内部方法）"""

@@ -16,17 +16,44 @@ from src.core.errors import (
     VertexError,
     InvalidArgumentError,
     InternalError,
+    AuthenticationError,
+    PermissionDeniedError,
+    NotFoundError,
+    RateLimitError,
 )
 from src.api.vertex_client import VertexAIClient
 from src.api.openai_compat import (
     openai_request_to_gemini,
     gemini_response_to_openai,
     stream_gemini_as_openai,
+    convert_realtime_chunk,
 )
 from src.core.auth import api_key_manager
 from src.utils.logger import get_logger, set_request_id
+from src.utils.error_logger import save_error_snapshot
 
 logger = get_logger(__name__)
+
+
+def _vertex_error_to_oai(e: VertexError) -> dict[str, Any]:
+    """将内部 VertexError 转为 OpenAI 错误格式（按子类分类）"""
+    if isinstance(e, (InvalidArgumentError, NotFoundError)):
+        err_type = "invalid_request_error"
+    elif isinstance(e, RateLimitError):
+        err_type = "rate_limit_error"
+    elif isinstance(e, (AuthenticationError, PermissionDeniedError)):
+        err_type = "authentication_error"
+    elif isinstance(e, InternalError):
+        err_type = "server_error"
+    else:
+        err_type = "api_error"
+    return {
+        "error": {
+            "message": e.message,
+            "type": err_type,
+            "code": e.status if hasattr(e, "status") and e.status else None,
+        }
+    }
 
 
 def extract_api_key_from_request(request: Request) -> str | None:
@@ -278,30 +305,83 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         logger.info(f"[OpenAI] 请求: 模型={model}, 流式={is_stream}, 假流式={fake_stream}")
 
         if is_stream:
+            completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+            created = int(time.time())
+
             async def openai_stream():
                 try:
-                    gemini_gen = vertex_client.stream_chat(model=model, gemini_payload=gemini_payload)
-                    async for chunk in stream_gemini_as_openai(gemini_gen, model, fake_stream=fake_stream):
-                        yield chunk
+                    if fake_stream:
+                        # 假流式：保留旧路径（聚合后小块逐字发出）
+                        gemini_gen = vertex_client.stream_chat(model=model, gemini_payload=gemini_payload)
+                        async for chunk in stream_gemini_as_openai(gemini_gen, model, fake_stream=True):
+                            yield chunk
+                    else:
+                        # 真流式：逐 result 块转 OAI delta，渐进显示
+                        is_first = True
+                        has_finish = False
+                        # finish_reason 推迟到所有内容发完之后再发，
+                        # 避免上游把 finish 块放在内容前导致客户端提前截断
+                        deferred_finish: str | None = None
+                        async for gemini_chunk in vertex_client.stream_chat_realtime(
+                            model=model, gemini_payload=gemini_payload
+                        ):
+                            events = convert_realtime_chunk(
+                                gemini_chunk, model, completion_id, created, is_first=is_first
+                            )
+                            is_first = False
+                            for ev in events:
+                                ev_has_finish = '"finish_reason"' in ev and '"finish_reason": null' not in ev
+                                if ev_has_finish:
+                                    # 暂存最后一个 finish 事件，留到末尾发
+                                    deferred_finish = ev
+                                    continue
+                                yield ev
+                        if deferred_finish:
+                            yield deferred_finish
+                        else:
+                            # 上游一次都没给 finish_reason → 兜底补一个
+                            tail = {
+                                "id": completion_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            }
+                            yield f"data: {json.dumps(tail, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
                 except VertexError as e:
-                    err_resp = {
-                        "error": {
-                            "message": e.message,
-                            "type": "api_error",
-                            "code": e.status
-                        }
-                    }
-                    yield f"data: {json.dumps(err_resp)}\n\n"
+                    try:
+                        snapshot_path = save_error_snapshot(
+                            downstream_payload={"model": model, "stream": True, "fake_stream": fake_stream, "body": body},
+                            upstream_payload={"gemini_payload": gemini_payload},
+                            upstream_response=getattr(e, "upstream_response", "") or e.message,
+                            error_type=f"oai_stream_{type(e).__name__}",
+                        )
+                        if snapshot_path:
+                            logger.warning(f"OAI 流式异常已保存快照: {snapshot_path}")
+                    except Exception:
+                        pass
+                    err_resp = _vertex_error_to_oai(e)
+                    yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                 except Exception as e:
+                    try:
+                        save_error_snapshot(
+                            downstream_payload={"model": model, "stream": True, "fake_stream": fake_stream, "body": body},
+                            upstream_payload={"gemini_payload": gemini_payload},
+                            upstream_response=str(e),
+                            error_type=f"oai_stream_unhandled_{type(e).__name__}",
+                        )
+                    except Exception:
+                        pass
                     err_resp = {
                         "error": {
                             "message": str(e),
-                            "type": "internal_error",
-                            "code": "internal_error"
+                            "type": "server_error",
+                            "code": None,
                         }
                     }
-                    yield f"data: {json.dumps(err_resp)}\n\n"
+                    yield f"data: {json.dumps(err_resp, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
 
             return StreamingResponse(

@@ -353,6 +353,22 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 
 ---
 
+### 20. OAI 真流式：上游 finish_reason 顺序错乱（已修复）
+
+**现象**：把 `/v1/chat/completions` 改成真流式后（按上游 result 块逐个 yield），SillyTavern 偶尔提前截断输出，只看到很短一段就结束了。  
+**原因**：上游 batchGraphql 返回的 JSON 数组里，**finish_reason 块有时排在内容块前面**（thinking 模式下尤其明显）。客户端按顺序读到 `finish_reason: stop` 就以为结束了，后续内容被丢弃。  
+**解决**：在 `routes.py` 的真流式生成器里加 `deferred_finish` 缓存——任何带 finish 的事件都先存起来，等所有内容块全发完，再把最后一个 finish 事件发出去。**禁止**改回"按到达顺序原样转发"。
+
+---
+
+### 21. OAI 真流式：thinking 模式产生空 functionCall 噪音（已修复）
+
+**现象**：用 gemini-2.5-flash 真流式时，每条回复前会涌出 5~10 个 `tool_calls: [{"function": {"name": "", "arguments": "{}"}}]` 空块，酒馆显示一堆"调用了未命名工具"提示。  
+**原因**：上游 thinking 模式会在 parts 里塞 `functionCall: {}`（无 name 无 args）作为内部标记。我们的旧 SSE 转换函数照单全收。原来的"假流式"路径把所有 chunk 合并后只发一次，所以这些噪音被合并掉看不见；切真流式后才暴露出来。  
+**解决**：在 `openai_compat.py::gemini_sse_chunk_to_openai` 里过滤 `name` 为空的 functionCall。**禁止**移除这个过滤，否则空 tool_calls 会再次冒出来。
+
+---
+
 ### 15. 所有 CF 节点测速延迟相同
 
 **现象**：点"一键测速排序"后，订阅里所有节点显示完全相同的延迟（如全部 29ms）。  
