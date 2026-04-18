@@ -430,7 +430,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
   const errEl = document.getElementById('loginErr');
   errEl.style.display = 'none';
   try {
-    const data = await fetch('/api/admin/login', {
+    const data = await fetch('/admin/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: pw })
@@ -450,7 +450,7 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
 });
 
 async function logout() {
-  try { await api('POST', '/api/admin/logout'); } catch (e) {}
+  try { await api('POST', '/admin/api/logout'); } catch (e) {}
   token = '';
   localStorage.removeItem(TOKEN_KEY);
   showLogin();
@@ -477,7 +477,7 @@ async function loadAll() {
 }
 
 async function loadSettings() {
-  const s = await api('GET', '/api/admin/settings');
+  const s = await api('GET', '/admin/api/settings');
   document.getElementById('port_api').value = s.port_api;
   document.getElementById('max_retries').value = s.max_retries;
   document.getElementById('debug').checked = s.debug;
@@ -493,7 +493,7 @@ async function saveSettings() {
     debug: document.getElementById('debug').checked,
   };
   try {
-    const r = await api('PUT', '/api/admin/settings', body);
+    const r = await api('PUT', '/admin/api/settings', body);
     showToast('已保存', 'ok');
     const tip = document.getElementById('saveTip');
     tip.textContent = (r.notes && r.notes.length) ? r.notes.join(' · ') : '';
@@ -506,7 +506,7 @@ async function changePassword() {
   const v = document.getElementById('newPw').value.trim();
   if (v.length < 6) { showToast('密码至少 6 位', 'err'); return; }
   try {
-    await api('PUT', '/api/admin/settings', { admin_password: v });
+    await api('PUT', '/admin/api/settings', { admin_password: v });
     document.getElementById('newPw').value = '';
     showToast('密码已更新', 'ok');
   } catch (e) { showToast(e.message, 'err'); }
@@ -518,7 +518,7 @@ function maskKey(k) {
   return k.slice(0, 6) + '…' + k.slice(-4);
 }
 async function loadKeys() {
-  const data = await api('GET', '/api/admin/keys');
+  const data = await api('GET', '/admin/api/keys');
   const tbody = document.getElementById('keysTbody');
   tbody.innerHTML = '';
   if (!data.keys.length) {
@@ -554,7 +554,7 @@ async function addKey() {
   const description = document.getElementById('key_desc').value.trim();
   if (!name || !key) { showToast('name / key 不能为空', 'err'); return; }
   try {
-    await api('POST', '/api/admin/keys', { name, key, description });
+    await api('POST', '/admin/api/keys', { name, key, description });
     document.getElementById('key_name').value = '';
     document.getElementById('key_value').value = '';
     document.getElementById('key_desc').value = '';
@@ -565,7 +565,7 @@ async function addKey() {
 async function deleteKey(name) {
   if (!confirm('删除密钥 ' + name + ' ?')) return;
   try {
-    await api('DELETE', '/api/admin/keys/' + encodeURIComponent(name));
+    await api('DELETE', '/admin/api/keys/' + encodeURIComponent(name));
     await loadKeys();
     showToast('已删除', 'ok');
   } catch (e) { showToast(e.message, 'err'); }
@@ -583,7 +583,7 @@ function escapeHtml(s) {
 (async () => {
   if (token) {
     try {
-      await api('GET', '/api/admin/settings');
+      await api('GET', '/admin/api/settings');
       showApp();
       return;
     } catch (e) { /* fall through to login */ }

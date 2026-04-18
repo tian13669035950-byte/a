@@ -193,7 +193,7 @@ async def admin_page() -> FileResponse:
     return FileResponse(str(index), media_type="text/html; charset=utf-8")
 
 
-@router.post("/api/admin/login")
+@router.post("/admin/api/login")
 async def admin_login(body: LoginBody) -> dict[str, Any]:
     expected = _get_admin_password()
     if not expected:
@@ -205,7 +205,7 @@ async def admin_login(body: LoginBody) -> dict[str, Any]:
     return {"token": tok, "ttl_seconds": SESSION_TTL}
 
 
-@router.post("/api/admin/logout")
+@router.post("/admin/api/logout")
 async def admin_logout(request: Request) -> dict[str, str]:
     auth = request.headers.get("Authorization", "")
     if auth.lower().startswith("bearer "):
@@ -213,7 +213,7 @@ async def admin_logout(request: Request) -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/api/admin/settings")
+@router.get("/admin/api/settings")
 async def get_settings(request: Request) -> dict[str, Any]:
     _require_auth(request)
     cfg = load_config()
@@ -225,7 +225,7 @@ async def get_settings(request: Request) -> dict[str, Any]:
     }
 
 
-@router.put("/api/admin/settings")
+@router.put("/admin/api/settings")
 async def update_settings(body: SettingsBody, request: Request) -> dict[str, Any]:
     _require_auth(request)
     cfg = _read_json(CONFIG_FILE, {})
@@ -261,13 +261,13 @@ async def update_settings(body: SettingsBody, request: Request) -> dict[str, Any
     return {"status": "ok", "notes": notes}
 
 
-@router.get("/api/admin/keys")
+@router.get("/admin/api/keys")
 async def get_keys(request: Request) -> dict[str, Any]:
     _require_auth(request)
     return {"keys": _read_api_keys()}
 
 
-@router.post("/api/admin/keys")
+@router.post("/admin/api/keys")
 async def add_key(body: KeyBody, request: Request) -> dict[str, str]:
     _require_auth(request)
     name = body.name.strip()
@@ -287,7 +287,7 @@ async def add_key(body: KeyBody, request: Request) -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.delete("/api/admin/keys/{name}")
+@router.delete("/admin/api/keys/{name}")
 async def delete_key(name: str, request: Request) -> dict[str, str]:
     _require_auth(request)
     keys = _read_api_keys()

@@ -156,7 +156,7 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
 
     app.add_middleware(
         APIKeyMiddleware,
-        excluded_paths=["/", "/health", "/proxy-manager", "/admin", "/api/admin"],
+        excluded_paths=["/", "/health", "/proxy-manager", "/admin"],
     )
     app.add_middleware(
         CORSMiddleware,
