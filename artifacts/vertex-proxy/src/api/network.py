@@ -187,29 +187,31 @@ class NetworkClient:
     async def fetch_recaptcha_token(self, session: Any) -> Optional[str]:
         """
         获取 Google Recaptcha Token。
-        策略：直连优先（primp Chrome TLS 指纹可靠绕过 Google 检测）。
-        直连失败时尝试代理，防止极端网络环境下直连不可用。
+        策略：代理优先，与后续 Gemini 请求保持同源 IP，避免 Google 反欺诈
+        将"换 IP 用 token"识别为可疑请求并返回空响应。
+        直连只在没有代理或代理彻底失败时作为兜底。
         """
-        # 1. 直连（primp 伪装 Chrome，生产/开发均可靠）
-        for attempt in range(3):
-            token = await _do_recaptcha_request(None)
-            if token:
-                logger.debug("直连模式获取 Recaptcha Token 成功")
-                return token
-            logger.debug(f"直连 recaptcha 失败 ({attempt+1}/3)")
+        proxy = _get_proxy() if _socks5_reachable() else None
 
-        # 2. 直连失败才尝试代理（兜底）
-        proxy = _get_proxy()
-        if proxy and _socks5_reachable():
-            logger.warning("直连 recaptcha 全部失败，尝试代理模式")
+        # 1. 代理优先（Token 与 Gemini 请求源 IP 一致）
+        if proxy:
             for attempt in range(3):
                 token = await _do_recaptcha_request(proxy)
                 if token:
-                    logger.debug("代理模式获取 Recaptcha Token 成功")
+                    logger.debug("代理模式获取 Recaptcha Token 成功（与请求同源 IP）")
                     return token
                 logger.warning(f"代理模式 recaptcha 失败 ({attempt+1}/3)")
+            logger.warning("代理模式 recaptcha 全部失败，降级直连兜底")
 
-        logger.error("Recaptcha Token 获取失败（直连+代理均已尝试）")
+        # 2. 直连兜底（IP 不一致，可能触发反欺诈，但聊胜于无）
+        for attempt in range(3):
+            token = await _do_recaptcha_request(None)
+            if token:
+                logger.debug("直连模式获取 Recaptcha Token 成功（注意：与代理 IP 不一致）")
+                return token
+            logger.debug(f"直连 recaptcha 失败 ({attempt+1}/3)")
+
+        logger.error("Recaptcha Token 获取失败（代理+直连均已尝试）")
         return None
 
     def create_session(self) -> MockSession:
