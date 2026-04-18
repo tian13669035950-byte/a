@@ -183,7 +183,7 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
     # ==================== 基础端点 ====================
 
     async def root():
-        return RedirectResponse(url="/proxy-manager")
+        return RedirectResponse(url="/admin")
     app.get("/")(root)
 
     async def health_check() -> dict[str, str | int]:
