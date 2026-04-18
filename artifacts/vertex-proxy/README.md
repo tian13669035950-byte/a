@@ -73,14 +73,14 @@ artifacts/vertex-proxy/
 
 如果你最近换过节点，建议在工作区 admin 里点一下"刷新节点"，让缓存重写到磁盘后再 commit + deploy，否则部署出去用的是老缓存。
 
-#### ✅ Deployment Secrets 单独设
+#### ✅ Deployment Secrets（按需设置）
 
-⚠️ Replit 的 dev 环境 secret **不会自动同步到部署**。在 Deployments 页面单独加：
+⚠️ Replit 的 dev 环境 secret **不会自动同步到部署**。如果要覆盖默认值，在 Deployments 页面单独加：
 
 | Secret | 必要程度 | 说明 |
 |---|---|---|
-| `API_KEY` | **必加** | 不加就用默认 `sk-123456`，谁都能调你的 API |
-| `ADMIN_PASSWORD` | 推荐 | 不加就用硬编码的 `1966197012` |
+| `API_KEY` | 可选 | 不加就用默认 `sk-123456`。**如果只是你自己用、URL 不外传，默认就行**；要给别人用就改成自定义随机串 |
+| `ADMIN_PASSWORD` | 可选 | 不加就用硬编码的 `1966197012` |
 | `SESSION_SECRET` | 推荐 | 从 dev 复制过去 |
 
 #### ✅ 不需要
@@ -88,6 +88,7 @@ artifacts/vertex-proxy/
 - ❌ Google Cloud 项目 / Service Account / GCP 凭据
 - ❌ 配置出站白名单（Replit 默认全放行）
 - ❌ 给 Vertex API 绑信用卡
+- ❌ **手动填运行命令、端口、健康检查** —— 全部由 `artifact.toml` 自动配置
 
 ### 部署后第一次操作
 
@@ -100,6 +101,43 @@ artifacts/vertex-proxy/
 - **5 分钟内连续聊天**：秒回（实例热的）
 - **隔了 10 分钟再发**：第一句等 3-8 秒（冷启动），之后秒回
 - **隔了几小时**：同上，第一句稍慢，之后正常
+
+---
+
+## 🤖 给另一个账号 / 另一个 AI 的部署指引
+
+如果要把这个仓库交给另一个 Replit 账号（或者让另一个 AI 帮忙部署），告诉它三步就够：
+
+### 1. 导入仓库
+GitHub URL 给它，让它在 Replit 用 **Create Repl → Import from GitHub** 导入。
+
+### 2. 部署
+进 Deployments → 选 **Autoscale** → 点 **Deploy**。
+
+**不需要**手动填任何运行命令、端口、健康检查路径——全部已经在 `artifacts/vertex-proxy/.replit-artifact/artifact.toml` 里配好了：
+
+```toml
+[services.production.run]
+args = ["bash", "-c", 
+  "python3 -m pip install -r artifacts/vertex-proxy/requirements.txt -q && cd artifacts/vertex-proxy && python3 main.py"
+]
+
+[services.production.run.env]
+PORT = "8000"
+
+[services.production.health.startup]
+path = "/health"
+```
+
+Replit 平台会自动读这个文件配好一切。
+
+### 3. （可选）加 Secret
+**自己用的话直接默认就行，跳过这步**。要给别人用再去 Deployments → Secrets 加 `API_KEY` 自定义值。
+
+### ⚠️ 不要碰的文件
+
+- 仓库根目录的 `.replit` 里有一段 `[deployment]` 配置（路径写的是 `cd vertex-proxy` 而不是 `artifacts/vertex-proxy`），但**这个会被 `artifact.toml` 覆盖，实际不生效**
+- **不要去改那个 `.replit`** —— 平台认 `artifact.toml`，碰了反而出问题
 
 ---
 
