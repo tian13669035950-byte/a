@@ -178,7 +178,12 @@ class TokenCounter:
                 response = await self.network.post_request(session, url, headers, payload)
                 
                 if response.status_code == 200:
-                    data = response.json()
+                    # 兼容真流式响应包装（HttpxStreamingFakeResponse 没有 .json()）
+                    try:
+                        data = response.json()  # type: ignore[attr-defined]
+                    except AttributeError:
+                        raw = await response.aread() if hasattr(response, "aread") else response.text.encode()
+                        data = json.loads(raw)
                     logger.debug_json("CountTokens 响应体", data)
                     try:
                         items = data if isinstance(data, list) else [data]

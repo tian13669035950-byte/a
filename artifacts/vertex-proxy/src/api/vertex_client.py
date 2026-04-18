@@ -420,6 +420,8 @@ class VertexAIClient:
     async def _stream_realtime_inner(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
         """真流式内部循环（含重试 / 节点切换 / 首次 401 重试），与 _stream_chat_inner 同构"""
         max_retries = self.max_retries
+        quota_max_retries = 2
+        quota_attempts = 0
         content_yielded = False
         recaptcha_token = None
         is_first_auth_attempt = True
@@ -485,11 +487,13 @@ class VertexAIClient:
 
                 except RateLimitError as e:
                     logger.warning(f"真流式：限流 {e.message}")
-                    if content_yielded or attempt >= max_retries:
+                    quota_attempts += 1
+                    if content_yielded or quota_attempts > quota_max_retries or attempt >= max_retries:
+                        logger.error(f"真流式：配额重试已达上限 ({quota_attempts}/{quota_max_retries})")
                         raise
                     rotated = await self._rotate_with_refresh()
-                    wait_time = 3 if rotated else (e.retry_after if e.retry_after else min(30, 2 ** attempt + 1))
-                    logger.info(f"真流式：等待 {wait_time}s 后重试")
+                    wait_time = 3 if rotated else (e.retry_after if e.retry_after else min(10, 2 ** attempt + 1))
+                    logger.info(f"真流式：等待 {wait_time}s 后重试 ({quota_attempts}/{quota_max_retries})")
                     attempt += 1
                     await asyncio.sleep(wait_time)
                     continue
@@ -517,6 +521,9 @@ class VertexAIClient:
     async def _stream_chat_inner(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> AsyncGenerator[str, Any]:
         """实际的流式聊天逻辑（内部方法）"""
         max_retries = self.max_retries
+        # 配额耗尽专用重试上限：换 IP 通常救不回 per-project 配额，硬重试只是浪费时间
+        quota_max_retries = 2
+        quota_attempts = 0
         content_yielded = False
         
         logger.debug(f"开始内部流式聊天，最大重试次数: {max_retries}")
@@ -607,16 +614,20 @@ class VertexAIClient:
                 
                 except RateLimitError as e:
                     logger.warning(f"限流错误: {e.message}")
-                    if content_yielded or attempt >= max_retries:
+                    quota_attempts += 1
+                    # 配额错误专用上限：试 quota_max_retries 次（换 IP）后还不行就放弃，
+                    # 避免用户在酒馆等 1-2 分钟最后还是空回
+                    if content_yielded or quota_attempts > quota_max_retries or attempt >= max_retries:
+                        logger.error(f"配额重试已达上限 ({quota_attempts}/{quota_max_retries})，返回错误")
                         yield e.to_sse()
                         return
 
                     # 配额耗尽时，尝试自动切换到下一个代理节点（转满一圈自动重拉订阅）
                     rotated = await self._rotate_with_refresh()
                     if rotated:
-                        logger.info("配额耗尽，已自动切换到下一个代理节点（等待 3s 生效）")
+                        logger.info(f"配额耗尽，已自动切换到下一个代理节点 ({quota_attempts}/{quota_max_retries})")
 
-                    wait_time = 3 if rotated else (e.retry_after if e.retry_after else min(30, 2 ** attempt + 1))
+                    wait_time = 3 if rotated else (e.retry_after if e.retry_after else min(10, 2 ** attempt + 1))
                     logger.info(f"触发限流，等待 {wait_time}s 后重试 (第 {attempt + 1} 次重试)")
                     attempt += 1
                     await asyncio.sleep(wait_time)
