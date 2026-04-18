@@ -379,10 +379,89 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 - 同名添加自动覆盖；删除后立即热加载到 `api_key_manager`
 
 **踩坑**：
-- 中间件 `excluded_paths` 之前是 `path in 列表`（精确匹配），加 `/admin` 子路径会失败。已改成 `path == p OR path.startswith(p + "/")`。**禁止**改回精确匹配，否则 `/api/admin/login` 会被拦回 401。
+- 中间件 `excluded_paths` 之前是 `path in 列表`（精确匹配），加 `/admin` 子路径会失败。已改成 `path == p OR path.startswith(p + "/")`。**禁止**改回精确匹配，否则 `/admin/api/login` 会被拦回 401。
 - 顺带"修复"了 `/proxy-manager` 子路径之前必须用硬编码 sk-123456 才能访问的问题，现在 `/proxy-manager/*` 也走前缀豁免（**这是有意为之**，proxy-manager UI 行为不变）。
 - API_KEYS 文件支持两种格式：旧 `name:key`（两段）+ 新 `name:key:description`（三段）。**禁止**移除 `parts[2] if len(parts)>=3` 的兼容逻辑。
 - 改了密码后**老 token 不会被吊销**（in-memory session 不知道密码变了）。这是 known limitation，要彻底踢人需重启服务。
+
+---
+
+### 23. ⚠️ Replit 路由陷阱：/admin 后台不能用 /api/admin/* 前缀
+
+**现象**：admin 面板登录页一直 404 / 401，浏览器看到请求 `/api/admin/login` 没到达 vertex-proxy。
+
+**原因**：当前 monorepo 里有两个工件：
+- `vertex-proxy` 接管 `/`（FastAPI）
+- `api-server` 抢走 `/api`（独立工件）
+
+任何 `/api/*` 路径都会被 Replit 路由器送到 api-server，**永远不会到 vertex-proxy**。
+
+**解决**：admin 后台所有接口必须挂在 `/admin/api/*`（前缀属于 vertex-proxy 命名空间），不能用 `/api/admin/*`。
+
+**禁止**改回 `/api/admin/*` 命名风格，会立刻死掉。中间件 `excluded_paths = ["/", "/health", "/proxy-manager", "/admin"]` 的 `/admin` 通过前缀匹配自动覆盖 `/admin/api/*`。
+
+---
+
+### 24. 真流式（`_stream_realtime_inner`）的空回复检测
+
+`fs-` 模型走真流式路径，先把 chunks buffer 起来，用 `_extract_text_from_dict_chunks` 拼出文本。如果是空就触发节点切换重试，最多 `max_retries` 次。
+
+**禁止**改成"边收边发"，会导致空回复时已经把 SSE 头/前几个 data 行发出去了，客户端拿到一个看似正常但内容空的响应，无法重试也无法报错。
+
+---
+
+### 25. OAI 兼容层错误处理（typed errors + error snapshots）
+
+- `RateLimitError` / `AuthenticationError` / `VertexError` 继承 `VertexBaseError`，都有 `to_sse()` 把错误转成 OpenAI 错误格式（`{"error":{"message":..., "type":..., "code":...}}`）
+- 4 个响应路径全部用 `save_error_snapshot` 包装：OAI 流式 / OAI 非流式 / Gemini 流式 / Gemini 非流式
+- 上游异常会落盘到 `errors/` 目录（带请求/响应/堆栈），方便复盘
+
+**禁止**用 `except Exception: yield ""` 这种静默吞噬，所有错误必须以 OpenAI 错误格式返回客户端。
+
+---
+
+### 26. 配额错误（429 Resource Exhausted）有独立的重试上限
+
+**问题历史**：以前所有错误共用 `max_retries=10`，遇到 Vertex 项目级配额耗尽时，会换 IP 重试 10 次（每次 5-7 秒），用户在 SillyTavern 等 1-2 分钟最后还是空回。但是**配额是按 GCP 项目算的，不是按 IP**，换 IP 救不回。
+
+**现在**：
+```python
+quota_max_retries = 2  # 配额错误专用上限
+quota_attempts = 0     # 单独计数
+```
+
+试 2 次还失败就立刻返回明确错误（`Resource has been exhausted`），SillyTavern 会弹出真实错误信息，用户知道发生了什么、不用傻等。
+
+**禁止**移除 `quota_attempts` 单独计数，或把这个值调高到 5+。换 IP 试 1-2 次是为了兜住"恰好这个 IP 触发了 Replit 的 IP 级限流"的边角情况，不是为了硬刚 Google 配额。
+
+---
+
+### 27. Token 计数器对 HttpxStreamingFakeResponse 的兼容
+
+**问题**：`token_counter._count_tokens_with_session` 直接调 `response.json()`。`HttpxStreamingFakeResponse` 类只暴露了 `.text` / `.aread()` / `.aiter_lines()`，没有 `.json()` 方法，导致日志被刷：
+```
+❌ 远程 Token 计数失败: 'HttpxStreamingFakeResponse' object has no attribute 'json'
+```
+
+不影响主流程，但是噪音很大且会让真正的错误被淹没。
+
+**修复**：try `.json()`；`AttributeError` 时 fall back 到 `await response.aread()` + `json.loads()`。**禁止**给 `HttpxStreamingFakeResponse` 加同步 `.json()` 方法 —— 它包装的是 httpx 流式 response，body 可能没读完，同步调用会阻塞或炸。
+
+---
+
+### 28. /admin 加了 Proxy & Nodes tab，复用 /proxy-manager 后端
+
+admin 面板第三个标签页 "Proxy & Nodes"：
+- Status：当前出口代理 / xray 状态 / Google 可达性 / 节点数
+- Subscriptions：订阅链接 CRUD
+- Nodes：列表 + 一键启用
+- Manual proxy：直填 socks5/http 代理
+
+**所有接口直接调 `/proxy-manager/*` 现成 endpoint**，没新增后端代码。这是有意为之：
+- /admin tab 是常用操作的简化入口
+- /proxy-manager 完整页（"Advanced →" 链接）保留所有进阶功能（测速、配额扫描、country detect、自定义节点）
+
+**禁止**把 /admin tab 的逻辑改成调一套新的 admin/api/proxy/* 端点。等于建两套并行 API，难维护，且会跟现有 /proxy-manager 状态不同步。
 
 ---
 
@@ -464,9 +543,96 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 | 变量名 | 作用 | 不设置时 |
 |--------|------|---------|
 | `API_KEY` | 客户端访问密钥（自动补 `sk-` 前缀） | 用 `config/api_keys.txt` 里的 `sk-123456`，并在启动日志里打警告 |
-| `ADMIN_PASSWORD` | `/proxy-manager` 管理界面 HTTP Basic 密码 | 不启用密码校验，任何人都能访问管理页 |
+| `ADMIN_PASSWORD` | `/admin` 后台登录密码（优先级高于 `config.json`）| 首次启动随机生成 12 位密码，**WARN 级别**打印到日志 |
+| `SESSION_SECRET` | admin session token 签名（不设也能跑，但重启即失效）| 自动生成临时值 |
 | `SUB_URL` | 默认订阅链接（覆盖代码内置那条） | 用代码里硬编码的内置订阅 |
 | `PORT` | API 监听端口（Replit 部署自动注入） | 走 `config/config.json` 的 `port_api` |
+
+---
+
+## 部署到 Replit Deployments
+
+### 部署类型选择
+
+**用 Reserved VM**，不要用 Autoscale。
+
+| 维度 | Reserved VM ✅ | Autoscale ❌ |
+|------|---------------|-------------|
+| 状态文件持久化 | 跨重启保留（订阅、自定义节点、激活节点都在） | 每次冷启动都重置 |
+| xray 子进程 | 一次启动长跑 | 每个新实例都要重启 xray，节点切换状态丢失 |
+| xray 二进制 | 下载一次缓存到 `bin/xray` | 每个新实例都要重新下载（10MB+ 启动延时） |
+| 长流式响应（60-120s）| 不会被切 | 可能触发请求超时 |
+| 多 IP 轮换 | 单实例，IP 由 xray 节点决定（你想要的） | 自动横向扩，每个实例 IP 不同，反而扰乱 |
+
+### 发布前必做的检查
+
+部署是个**全新的容器**，不是当前 dev 环境的快照。需要确认：
+
+#### 1. Secrets 同步到 Deployment
+
+Replit 的 dev 环境 secrets 跟 deployment secrets 是**两套独立的池**。在 Deployments 页面单独添加：
+
+| Secret | 必须？ | 备注 |
+|--------|-------|------|
+| `ADMIN_PASSWORD` | **强烈推荐** | 不设的话每次重启会随机生成新密码，只在日志里打印，生产环境很难看到 |
+| `API_KEY` | **推荐** | 不设会用默认 `sk-123456`，谁都能调你的 API |
+| `SESSION_SECRET` | 推荐 | 已有 dev 端，复制过去即可 |
+| `SUB_URL` | 可选 | 如果不想依赖默认订阅 |
+
+#### 2. 生产环境状态文件是空的
+
+下面这些文件**不会**从 dev 带过去（`.gitignore` 里）：
+
+- `config/cached_nodes.json` — 节点缓存
+- `config/active_node.json` — 当前激活的节点
+- `config/sub_urls.json` — 订阅链接
+- `config/custom_nodes.json` — 自定义节点
+- `config/api_keys.txt` — API 密钥（如果没用 `API_KEY` env）
+- `bin/xray` — xray 二进制
+
+→ **第一次部署后**，进 `/admin` 或 `/proxy-manager` 重新加一遍订阅链接，刷新一次节点列表。xray 会自动下载。整个过程 ~30 秒。
+
+#### 3. 不需要任何 GCP / Google 凭据
+
+本服务用的是 Vertex AI **匿名 console 接口**（Recaptcha Token 鉴权），无需：
+- ❌ Google Cloud 项目
+- ❌ Service Account JSON
+- ❌ `GOOGLE_APPLICATION_CREDENTIALS`
+- ❌ API Key 计费绑定
+
+#### 4. 出站网络要能通到这些域名
+
+Replit Deployments 默认放行所有出站，**通常不需要做任何配置**。但如果未来有限制，需要保证可达：
+
+| 目标 | 用途 |
+|------|------|
+| `cloudconsole-pa.clients6.google.com` | Vertex AI 实际请求落点 |
+| `console.cloud.google.com` | Recaptcha Token 抓取 |
+| `www.google.com` | Recaptcha 子资源 |
+| `github.com` / `releases.githubusercontent.com` | 首次启动下载 xray 二进制 |
+| 你的订阅链接 host | 拉节点 |
+| 你订阅里的节点 IP/域名 | xray socks5 出口 |
+
+#### 5. 端口绑定
+
+代码已经读 `PORT` 环境变量（Replit 注入）。**不要**在 `config.json` 里硬写 8080，否则 Replit 路由器找不到端口会显示 502。
+
+### 部署后第一件事
+
+1. 看 deployment logs 找这一行（首次启动）：  
+   ```
+   ✅ admin 自动密码：xxxxxxxxxxxx (请尽快通过环境变量 ADMIN_PASSWORD 覆盖)
+   ```
+   除非你已经设了 `ADMIN_PASSWORD`，否则记下这串密码。
+2. 访问 `https://<your-app>.replit.app/admin` 用这个密码登录。
+3. 进 "Proxy & Nodes" tab → 加订阅 → 刷新节点 → 启用一个节点。
+4. 用 SillyTavern 测一下 `https://<your-app>.replit.app/v1/chat/completions`。
+
+### 已知部署陷阱
+
+- **首次冷启动 + 第一个请求** 容易 401/超时：xray 还没起来，Recaptcha Token 还没抓到。耐心等 5-10 秒重试一次就好。
+- **Replit deployment 重启 = 节点缓存还在但 xray 进程没了**：会自动恢复（main.py 里有 `restore_active_node`）。
+- **配额错误**（`Resource has been exhausted`）：不是 bug。匿名 Vertex 配额按项目算，跟你的部署机器数量无关，跟你换什么 IP 也无关。等几小时滚动重置，或换 `gemini-2.5-flash`（配额比 pro 宽松）。
 
 ---
 
@@ -491,8 +657,14 @@ TLS connect error: error:00000000:invalid library (0):OPENSSL_internal:invalid l
 | 加"代理全失败兜底走直连"的 ContextVar | 违背项目用代理保护 Replit IP 的初衷；应该明确报错让用户换节点 | 第 18 条 |
 | 给 vertex 响应加"无 finishReason 就当截断重试"的判定 | 部分模型/部分调用确实会出现末包没有 finishReason 的合法响应，会触发不必要的重试，浪费配额 | 历史 |
 | 直接编辑 `artifact.toml` / `.replit` | 应该用平台提供的工件管理工具改 | — |
+| 把 admin 接口路径用 `/api/admin/*` | 会被同 monorepo 里的 api-server 工件抢走，永远 404 | 第 23 条 |
+| 把中间件 `excluded_paths` 改回精确匹配（`path in 列表`）| 子路径如 `/admin/api/login` 会被拦回 401，登录页直接死 | 第 22/23 条 |
+| 把真流式（`fs-` 模型）改成"边收边发不缓冲" | 空回复时 SSE 头已发出，无法重试也无法报错 | 第 24 条 |
+| 把 `quota_max_retries` 调到 5 以上、或合并回 `max_retries` | 配额是 GCP 项目级，换 IP 救不回，硬重试只是让用户在酒馆等 1-2 分钟最后还是空 | 第 26 条 |
+| 给 `HttpxStreamingFakeResponse` 加同步 `.json()` | 包装的是 httpx 流式 response，body 可能没读完，同步调用会阻塞或炸 | 第 27 条 |
+| 给 admin 的 Proxy & Nodes tab 单独建一套 admin/api/proxy/* 后端 | 等于建两套并行 API，会跟现有 /proxy-manager 状态不同步 | 第 28 条 |
 
-**遇到 bug 优先去查"已知问题"列表（共 19 条）。如果要新增逻辑，请先确认 README 里没写过这条已经被否决的方案。**
+**遇到 bug 优先去查"已知问题"列表（共 28 条）。如果要新增逻辑，请先确认 README 里没写过这条已经被否决的方案。**
 
 ---
 
