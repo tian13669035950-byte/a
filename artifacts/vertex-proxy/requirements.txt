@@ -1,0 +1,16 @@
+# 核心 Web 框架
+fastapi
+uvicorn
+pydantic
+starlette
+
+# 网络请求与浏览器 TLS 指纹伪装 (primp: Rust 静态链接，无系统 OpenSSL 依赖)
+primp
+httpx
+
+# HTML 解析 (用于抓取 Recaptcha Token)
+beautifulsoup4
+lxml
+
+# YAML 解析 (用于 Clash 订阅格式)
+pyyaml
