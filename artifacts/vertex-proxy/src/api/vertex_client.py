@@ -51,6 +51,45 @@ class VertexAIClient:
         """关闭客户端并释放资源"""
         await self.network.close()
 
+    @staticmethod
+    async def _rotate_with_refresh() -> bool:
+        """
+        切换到下一个代理节点。
+        若已转满一圈（所有节点都试过），自动重拉订阅并从头开始。
+        返回 True 表示成功切换（可能是切换节点 or 刷新后首个节点）。
+        """
+        try:
+            from proxy_manager import proxy_state as _ps
+            if _ps.get_node_count() <= 0:
+                return False
+
+            rotated = _ps.rotate_to_next()
+
+            if _ps.needs_refresh():
+                logger.warning("所有节点已轮换一圈，自动重拉订阅获取新节点列表…")
+                try:
+                    from proxy_manager.routes import SUB_URL
+                    from proxy_manager.subscription import fetch_and_parse
+                    from proxy_manager.xray_manager import start_xray
+                    new_nodes = await asyncio.to_thread(fetch_and_parse, SUB_URL)
+                    if new_nodes:
+                        _ps.set_nodes(new_nodes)   # 重置节点列表 + 计数
+                        ok, _ = start_xray(new_nodes[0])
+                        if ok:
+                            logger.success(f"订阅刷新成功，共 {len(new_nodes)} 个节点，已切到第 1 个")
+                            return True
+                        logger.warning("订阅刷新后第一个节点启动失败，继续用旧节点")
+                    else:
+                        logger.warning("订阅刷新返回空节点，继续用现有列表")
+                        _ps.reset_rotation_count()
+                except Exception as ex:
+                    logger.warning(f"订阅自动刷新失败: {ex}，继续使用现有节点")
+                    _ps.reset_rotation_count()
+
+            return rotated
+        except Exception:
+            return False
+
     async def complete_chat(self, model: str, gemini_payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         """聚合流式响应为非流式 ChatCompletion 对象"""
         _raw_image_response = kwargs.pop('_raw_image_response', False)
@@ -264,15 +303,11 @@ class VertexAIClient:
                     actual_text = self._extract_text_from_sse_chunks(buffered_chunks)
                     if not actual_text.strip() and attempt < max_retries:
                         logger.warning(f"收到空回复（无文字内容），自动重试（第 {attempt + 1} 次）")
-                        # 尝试换一个代理节点再试
-                        try:
-                            from proxy_manager import proxy_state as _ps
-                            if _ps.get_node_count() > 1:
-                                if _ps.rotate_to_next():
-                                    logger.info("空回复，已自动切换到下一个代理节点")
-                                    await asyncio.sleep(2)
-                        except Exception:
-                            pass
+                        # 尝试换一个代理节点再试（转满一圈自动重拉订阅）
+                        switched = await self._rotate_with_refresh()
+                        if switched:
+                            logger.info("空回复，已自动切换到下一个代理节点")
+                            await asyncio.sleep(2)
                         recaptcha_token = None  # 强制重新拿 token
                         attempt += 1
                         continue
@@ -320,16 +355,10 @@ class VertexAIClient:
                         yield e.to_sse()
                         return
 
-                    # 配额耗尽时，尝试自动切换到下一个代理节点
-                    rotated = False
-                    try:
-                        from proxy_manager import proxy_state as _ps
-                        if _ps.get_node_count() > 1:
-                            rotated = _ps.rotate_to_next()
-                            if rotated:
-                                logger.info(f"配额耗尽，已自动切换到下一个代理节点（等待 3s 生效）")
-                    except Exception:
-                        pass
+                    # 配额耗尽时，尝试自动切换到下一个代理节点（转满一圈自动重拉订阅）
+                    rotated = await self._rotate_with_refresh()
+                    if rotated:
+                        logger.info("配额耗尽，已自动切换到下一个代理节点（等待 3s 生效）")
 
                     wait_time = 3 if rotated else (e.retry_after if e.retry_after else min(30, 2 ** attempt + 1))
                     logger.info(f"触发限流，等待 {wait_time}s 后重试 (第 {attempt + 1} 次重试)")
