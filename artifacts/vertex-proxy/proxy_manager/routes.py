@@ -28,6 +28,10 @@ SUB_URLS_FILE = os.path.join(PROJ_ROOT, "config", "sub_urls.json")
 _bench_running: bool = False
 _bench_results: dict = {}  # index -> latency_ms or None
 
+_quota_running: bool = False
+_quota_results: dict = {}   # index -> "ok" | "exhausted" | "dead" | "checking"
+_quota_current: int = -1    # 当前正在检测的节点索引
+
 
 def _load_sub_urls() -> list:
     try:
@@ -585,6 +589,106 @@ async def bench_status():
     return {"running": _bench_running, "results": _bench_results}
 
 
+@router.post("/quota-scan")
+async def quota_scan(request: Request):
+    """依次启动每个节点，发一个 HTTPS 请求检测能否连上 Google，判断节点是否可用/额度耗尽"""
+    import asyncio
+    global _quota_running, _quota_results, _quota_current, _cached_nodes
+
+    if _quota_running:
+        return {"ok": False, "error": "检测正在进行中，请稍候"}
+    if not _cached_nodes:
+        return {"ok": False, "error": "节点列表为空，请先刷新订阅"}
+
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    max_nodes = int(body.get("max_nodes", 30))
+    nodes_to_check = min(max_nodes, len(_cached_nodes))
+
+    _quota_running = True
+    _quota_results = {}
+    _quota_current = -1
+    nodes_snap = list(_cached_nodes[:nodes_to_check])
+
+    def _check_node_sync(node: dict, timeout: float = 7.0) -> str:
+        """同步：启动 xray，用 httpx SOCKS5 打 google/generate_204 检测"""
+        try:
+            ok, msg = start_xray(node)
+            if not ok:
+                return "dead"
+            time.sleep(0.5)  # xray 内部已 sleep(1.5)，再稍等让端口就绪
+            try:
+                import httpx
+                with httpx.Client(
+                    proxy="socks5://127.0.0.1:1080",
+                    timeout=timeout,
+                    follow_redirects=False,
+                ) as client:
+                    r = client.get("https://www.google.com/generate_204")
+                    if r.status_code == 429:
+                        return "exhausted"
+                    elif r.status_code in (204, 200, 301, 302):
+                        return "ok"
+                    else:
+                        return "dead"
+            except Exception:
+                return "dead"
+        except Exception:
+            return "dead"
+
+    async def _run():
+        global _quota_running, _quota_results, _quota_current, _cached_nodes
+        try:
+            loop = asyncio.get_event_loop()
+            for i, node in enumerate(nodes_snap):
+                _quota_current = i
+                _quota_results[i] = "checking"
+                status = await loop.run_in_executor(None, _check_node_sync, node)
+                _quota_results[i] = status
+        finally:
+            _quota_current = -1
+            _quota_running = False
+            # 扫完后自动切回第一个 "ok" 节点
+            first_ok = next((i for i, s in _quota_results.items() if s == "ok"), None)
+            if first_ok is not None and first_ok < len(_cached_nodes):
+                await asyncio.get_event_loop().run_in_executor(
+                    None, start_xray, _cached_nodes[first_ok]
+                )
+
+    asyncio.create_task(_run())
+    return {"ok": True, "total": nodes_to_check, "message": f"正在检测前 {nodes_to_check} 个节点，请稍候…"}
+
+
+@router.get("/quota-scan/status")
+async def quota_scan_status():
+    return {
+        "running": _quota_running,
+        "current": _quota_current,
+        "results": _quota_results,
+    }
+
+
+@router.post("/quota-scan/remove-failed")
+async def quota_scan_remove_failed():
+    """删除所有检测结果为 dead 或 exhausted 的节点"""
+    global _cached_nodes, _quota_results
+    if _quota_running:
+        return {"ok": False, "error": "检测仍在进行，请等待完成"}
+    failed_indices = {i for i, s in _quota_results.items() if s in ("dead", "exhausted")}
+    if not failed_indices:
+        return {"ok": True, "removed": 0, "message": "没有需要删除的节点"}
+    new_nodes = [n for i, n in enumerate(_cached_nodes) if i not in failed_indices]
+    removed = len(_cached_nodes) - len(new_nodes)
+    _cached_nodes = new_nodes
+    _quota_results = {}
+    _save_nodes_to_disk(_cached_nodes)
+    proxy_state.set_nodes(_cached_nodes)
+    return {"ok": True, "removed": removed, "message": f"已删除 {removed} 个无效节点"}
+
+
 @router.get("/status")
 async def status():
     proxy = proxy_state.get_proxy()
@@ -858,9 +962,12 @@ textarea.input { font-family: monospace; font-size: 12px; resize: vertical; min-
       <button class="btn btn-ghost" onclick="loadNodes(true)" id="btn-refresh">🔄 刷新节点列表</button>
       <button class="btn btn-primary" onclick="startBench(this)" id="btn-bench">⚡ 一键测速排序</button>
       <button class="btn btn-success" onclick="pickBest()" id="btn-best" style="display:none">🏆 选最优节点</button>
+      <button class="btn btn-ghost" onclick="startQuotaScan()" id="btn-quota">🔍 检测可用节点</button>
+      <button class="btn" onclick="removeFailedNodes()" id="btn-remove-failed" style="display:none;background:#dc2626;color:#fff">🗑 删除无效节点</button>
       <span class="lm" id="node-count"></span>
       <span id="detect-status" style="font-size:12px;color:#f59e0b;display:none">⏳ 正在检测出口国家…</span>
       <span id="bench-status" style="font-size:12px;color:#f59e0b;display:none">⏳ 测速中…</span>
+      <span id="quota-status" style="font-size:12px;color:#f59e0b;display:none">⏳ 正在检测节点可用性…</span>
     </div>
     <div id="table-container"><span class="loading">点击"刷新节点列表"加载节点…</span></div>
   </div>
@@ -1170,21 +1277,37 @@ function latencyBadge(n) {
   return `<span style="color:${color};font-family:monospace;font-size:12px;font-weight:600">${ms}ms</span>`;
 }
 
+let quotaResults = {}; // index -> "ok"|"dead"|"exhausted"|"checking"
+
+function quotaBadge(i) {
+  const s = quotaResults[i];
+  if (!s) return '';
+  if (s === 'checking') return '<span style="color:#f59e0b;font-size:11px">⏳</span>';
+  if (s === 'ok') return '<span style="color:#22c55e;font-size:12px" title="可连接Google">✅</span>';
+  if (s === 'exhausted') return '<span style="color:#ef4444;font-size:12px" title="429 额度耗尽">🚫</span>';
+  return '<span style="color:#6b7280;font-size:12px" title="连接超时/失败">💀</span>';
+}
+
 function renderTable() {
   if (!nodes.length) {
     document.getElementById('table-container').innerHTML = '<span class="loading">没有找到节点</span>';
     return;
   }
   const hasBench = nodes.some(n => n.latency_ms !== undefined && n.latency_ms !== null);
+  const hasQuota = Object.keys(quotaResults).length > 0;
   const bestBtn = document.getElementById('btn-best');
   bestBtn.style.display = hasBench ? 'inline-flex' : 'none';
 
-  let html = '<table><thead><tr><th>#</th><th>延迟</th><th>国家</th><th>名称</th><th>地址</th><th>端口</th><th>协议</th><th>操作</th></tr></thead><tbody>';
+  const quotaHeader = hasQuota ? '<th>可用</th>' : '';
+  let html = `<table><thead><tr><th>#</th><th>延迟</th><th>国家</th><th>名称</th><th>地址</th><th>端口</th><th>协议</th>${quotaHeader}<th>操作</th></tr></thead><tbody>`;
   nodes.forEach((n, i) => {
     const protoCls = n.protocol === 'vless' ? 'proto-vless' : 'proto-vmess';
     const isBest = hasBench && i === 0 && n.latency_ms !== null;
-    const rowStyle = isBest ? 'background:#14532d22;' : i === 1 && hasBench && n.latency_ms !== null ? 'background:#0c4a6e22;' : '';
+    const qStatus = quotaResults[i];
+    const isDead = qStatus === 'dead' || qStatus === 'exhausted';
+    const rowStyle = isDead ? 'opacity:0.45;' : isBest ? 'background:#14532d22;' : i === 1 && hasBench && n.latency_ms !== null ? 'background:#0c4a6e22;' : '';
     const crown = isBest ? '👑 ' : '';
+    const quotaCell = hasQuota ? `<td style="text-align:center">${quotaBadge(i)}</td>` : '';
     html += `<tr style="${rowStyle}">
       <td class="lm">${i+1}</td>
       <td>${latencyBadge(n)}</td>
@@ -1193,6 +1316,7 @@ function renderTable() {
       <td style="font-family:monospace;font-size:12px">${escHtml((n.server||n.address||''))}</td>
       <td>${n.port}</td>
       <td><span class="proto-badge ${protoCls}">${(n.protocol||'').toUpperCase()}</span></td>
+      ${quotaCell}
       <td><button class="btn btn-success btn-sm" onclick="selectNode(${i})">选择</button></td>
     </tr>`;
   });
@@ -1305,6 +1429,75 @@ async function pickBest() {
   const idx = nodes.indexOf(best);
   showAlert(`正在选择最优节点: 👑 ${best.name} (${best.latency_ms}ms)…`, 'success');
   await selectNode(idx);
+}
+
+// ── 额度检测 ──────────────────────────────────────────────────────────────────
+
+let quotaPollTimer = null;
+
+async function startQuotaScan() {
+  if (!nodes.length) { showAlert('请先加载节点列表', 'error'); return; }
+  quotaResults = {};
+  document.getElementById('btn-quota').disabled = true;
+  document.getElementById('btn-remove-failed').style.display = 'none';
+  const qs = document.getElementById('quota-status');
+  qs.style.display = 'inline';
+  qs.style.color = '#f59e0b';
+  qs.textContent = '⏳ 正在检测节点可用性…';
+  renderTable();
+  try {
+    const d = await api('/quota-scan', { method: 'POST', body: JSON.stringify({ max_nodes: Math.min(nodes.length, 30) }) });
+    if (!d.ok) {
+      showAlert('检测失败: ' + d.error, 'error');
+      qs.style.display = 'none';
+      document.getElementById('btn-quota').disabled = false;
+      return;
+    }
+    showAlert(d.message, 'success');
+    if (quotaPollTimer) clearInterval(quotaPollTimer);
+    quotaPollTimer = setInterval(pollQuotaStatus, 2000);
+  } catch(e) {
+    showAlert('启动检测出错: ' + e, 'error');
+    qs.style.display = 'none';
+    document.getElementById('btn-quota').disabled = false;
+  }
+}
+
+async function pollQuotaStatus() {
+  try {
+    const d = await api('/quota-scan/status');
+    quotaResults = d.results || {};
+    const qs = document.getElementById('quota-status');
+    renderTable();
+    if (!d.running) {
+      clearInterval(quotaPollTimer); quotaPollTimer = null;
+      const ok = Object.values(quotaResults).filter(s => s === 'ok').length;
+      const bad = Object.values(quotaResults).filter(s => s === 'dead' || s === 'exhausted').length;
+      qs.style.color = '#22c55e';
+      qs.textContent = `✅ 检测完成：${ok} 可用，${bad} 无效`;
+      document.getElementById('btn-quota').disabled = false;
+      if (bad > 0) document.getElementById('btn-remove-failed').style.display = 'inline-flex';
+    } else if (d.current >= 0) {
+      qs.textContent = `⏳ 检测中… (${d.current + 1}/${Object.keys(quotaResults).length || '?'})`;
+    }
+  } catch(e) {}
+}
+
+async function removeFailedNodes() {
+  if (!confirm('确认删除所有检测结果为"超时/失败/额度耗尽"的节点？')) return;
+  try {
+    const d = await api('/quota-scan/remove-failed', { method: 'POST' });
+    if (d.ok) {
+      showAlert(`✅ ${d.message}`, 'success');
+      quotaResults = {};
+      document.getElementById('btn-remove-failed').style.display = 'none';
+      await loadNodes();
+    } else {
+      showAlert('删除失败: ' + d.error, 'error');
+    }
+  } catch(e) {
+    showAlert('操作出错: ' + e, 'error');
+  }
 }
 
 // ── 日志 ──────────────────────────────────────────────────────────────────────

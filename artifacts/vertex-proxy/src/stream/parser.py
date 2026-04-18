@@ -310,6 +310,7 @@ def parse_upstream_data(raw_data: str) -> dict[str, Any]:
                 if isinstance(data, dict):
                     _update_state_from_data(state, cast(dict[str, Any], data), path_index)
 
+
     except json.JSONDecodeError as e:
         state["has_error"] = True
         state["error_message"] = f"JSON parse error: {e}"
@@ -321,9 +322,15 @@ def parse_upstream_data(raw_data: str) -> dict[str, Any]:
         state["has_error"] = True
         state["error_message"] = f"Parse error: {str(e)}"
     
-    # 组装 parts - 先按原有逻辑收集所有parts
-    parts_by_path = cast(dict[int, Any], state['parts_by_path'])
-    ordered_parts: list[dict[str, Any]] = [parts_by_path[k] for k in sorted(parts_by_path.keys())]
+    # 组装 parts - 按 path_index 排序，每个 index 可能有多个 parts（列表）
+    parts_by_path = cast(dict[int, list[Any]], state['parts_by_path'])
+    ordered_parts: list[dict[str, Any]] = []
+    for k in sorted(parts_by_path.keys()):
+        parts_at_index = parts_by_path[k]
+        if isinstance(parts_at_index, list):
+            ordered_parts.extend(cast(list[dict[str, Any]], parts_at_index))
+        else:
+            ordered_parts.append(cast(dict[str, Any], parts_at_index))
     unindexed_parts = cast(list[Any], state['unindexed_parts'])
     ordered_parts.extend(unindexed_parts)
     
@@ -356,6 +363,9 @@ def _update_state_from_data(state: dict[str, Any], data: dict[str, Any], path_in
         parts = content.get('parts', [])
         for part in parts:
             if path_index != -1:
-                state['parts_by_path'][path_index] = part
+                # 用列表收集，避免同一 path_index 的多个 part 互相覆盖（截断 bug）
+                if path_index not in state['parts_by_path']:
+                    state['parts_by_path'][path_index] = []
+                state['parts_by_path'][path_index].append(part)
             else:
                 state['unindexed_parts'].append(part)
