@@ -636,13 +636,13 @@ async def quota_scan(request: Request):
     # 轮流用这两个模型检测真实 Gemini 配额（不只是连通性）
     SCAN_MODELS = ["gemini-2.5-pro", "gemini-3.1-pro-preview"]
 
-    def _check_node_sync(node: dict, model_name: str, timeout: float = 25.0) -> str:
+    def _check_node_sync(node: dict, model_name: str, timeout: float = 75.0) -> str:
         """同步：启动 xray，调本地 /v1/chat/completions 用真实 Gemini 模型试一句话"""
         try:
             ok, _msg = start_xray(node)
             if not ok:
                 return "dead"
-            time.sleep(0.5)  # xray 内部已 sleep(1.5)，再稍等让端口就绪
+            # xray 内部已 _wait_socks5_ready，无需额外等待
             try:
                 import httpx
                 payload = {
