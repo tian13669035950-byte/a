@@ -275,14 +275,14 @@ def gemini_sse_chunk_to_openai(
     model: str,
     completion_id: str,
     created: int
-) -> str | None:
+) -> list[str]:
     """
-    将单个 Gemini SSE chunk (已解析的 JSON) 转换为 OpenAI SSE 格式字符串。
-    返回 None 表示跳过该 chunk。
+    将单个 Gemini SSE chunk (已解析的 JSON) 转换为 OpenAI SSE 格式字符串列表。
+    返回空列表表示跳过该 chunk。若 chunk 同时含内容和 finish_reason，则拆为两条。
     """
     candidates = gemini_chunk_json.get("candidates", [])
     if not candidates:
-        return None
+        return []
 
     choices: list[dict[str, Any]] = []
     for idx, candidate in enumerate(candidates):
@@ -335,17 +335,52 @@ def gemini_sse_chunk_to_openai(
         })
 
     if not any(c["delta"] for c in choices) and not any(c["finish_reason"] for c in choices):
-        return None
+        return []
 
-    chunk = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": choices,
-        "system_fingerprint": None
-    }
-    return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+    results: list[str] = []
+
+    has_content = any(c["delta"] for c in choices)
+    has_finish = any(c["finish_reason"] for c in choices)
+
+    if has_content and has_finish:
+        content_choices = [
+            {**c, "finish_reason": None} for c in choices
+        ]
+        content_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": content_choices,
+            "system_fingerprint": None
+        }
+        results.append(f"data: {json.dumps(content_chunk, ensure_ascii=False)}\n\n")
+
+        finish_choices = [
+            {"index": c["index"], "delta": {}, "finish_reason": c["finish_reason"], "logprobs": None}
+            for c in choices
+        ]
+        finish_chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": finish_choices,
+            "system_fingerprint": None
+        }
+        results.append(f"data: {json.dumps(finish_chunk, ensure_ascii=False)}\n\n")
+    else:
+        chunk = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": choices,
+            "system_fingerprint": None
+        }
+        results.append(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n")
+
+    return results
 
 
 async def stream_gemini_as_openai(
@@ -383,8 +418,8 @@ async def stream_gemini_as_openai(
             except json.JSONDecodeError:
                 continue
 
-            openai_line = gemini_sse_chunk_to_openai(gemini_json, model, completion_id, created)
-            if openai_line:
+            openai_lines = gemini_sse_chunk_to_openai(gemini_json, model, completion_id, created)
+            for openai_line in openai_lines:
                 yield openai_line
 
     yield "data: [DONE]\n\n"
