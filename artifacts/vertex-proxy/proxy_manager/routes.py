@@ -633,6 +633,10 @@ async def quota_scan(request: Request):
     _quota_current = -1
     nodes_snap = list(_cached_nodes[:nodes_to_check])
 
+    # 标记扫描中，禁止主请求触发 rotate（防止抢 xray 杀掉扫描连接）
+    from .proxy_state import set_scanning
+    set_scanning(True)
+
     # 轮流用这两个模型检测真实 Gemini 配额（不只是连通性）
     SCAN_MODELS = ["gemini-2.5-pro", "gemini-3.1-pro-preview"]
 
@@ -688,6 +692,7 @@ async def quota_scan(request: Request):
 
     async def _run():
         global _quota_running, _quota_results, _quota_current, _cached_nodes
+        from .proxy_state import set_scanning as _set_scanning
         try:
             loop = asyncio.get_event_loop()
             for i, node in enumerate(nodes_snap):
@@ -697,6 +702,7 @@ async def quota_scan(request: Request):
                 status = await loop.run_in_executor(None, _check_node_sync, node, model_name)
                 _quota_results[i] = status
         finally:
+            _set_scanning(False)
             _quota_current = -1
             _quota_running = False
             # 扫完后自动切回第一个 "ok" 节点
