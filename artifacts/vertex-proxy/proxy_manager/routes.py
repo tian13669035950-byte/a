@@ -477,6 +477,60 @@ async def status():
         "xray_running": xray_running,
         "google_reachable": google_ok,
         "latency_ms": latency_ms,
+        "node_count": proxy_state.get_node_count(),
+    }
+
+
+@router.get("/ip-check")
+async def ip_check():
+    """
+    检查当前代理的出口 IP 和直连 IP。
+    可以通过比较两个 IP 判断代理是否真的在换 IP。
+    """
+    import asyncio
+    import httpx
+
+    IP_APIS = [
+        "https://api.ipify.org?format=json",
+        "https://ip.sb/geoip",
+        "https://httpbin.org/ip",
+    ]
+
+    async def _fetch_ip(use_proxy: bool) -> dict:
+        proxy_url = proxy_state.get_proxy() if use_proxy else None
+        for api in IP_APIS:
+            try:
+                kwargs: dict = {"timeout": 10.0}
+                if proxy_url:
+                    kwargs["proxy"] = proxy_url
+                async with httpx.AsyncClient(**kwargs) as client:
+                    resp = await client.get(api)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        ip = data.get("ip") or data.get("origin", "").split(",")[0].strip()
+                        return {"ip": ip, "source": api, "ok": True}
+            except Exception as e:
+                continue
+        return {"ip": None, "ok": False, "error": "所有 IP 检查接口均失败"}
+
+    proxy_url = proxy_state.get_proxy()
+    direct_task = asyncio.create_task(_fetch_ip(False))
+    proxy_task = asyncio.create_task(_fetch_ip(True)) if proxy_url else None
+
+    direct_result = await direct_task
+    proxy_result = await proxy_task if proxy_task else {"ip": None, "ok": False, "error": "无代理配置"}
+
+    same_ip = (
+        direct_result.get("ip") and
+        proxy_result.get("ip") and
+        direct_result["ip"] == proxy_result["ip"]
+    )
+
+    return {
+        "direct_ip": direct_result,
+        "proxy_ip": proxy_result,
+        "same_as_direct": same_ip,
+        "warning": "代理出口 IP 与直连相同，换节点不会改变 Google 看到的 IP" if same_ip else None,
     }
 
 
@@ -581,9 +635,11 @@ textarea.input { font-family: monospace; font-size: 12px; resize: vertical; min-
       <span class="lm" id="latency-text"></span>
       <div class="btn-row" style="margin-left:auto">
         <button class="btn btn-primary" onclick="testProxy()">⚡ 测试当前代理</button>
+        <button class="btn btn-ghost" onclick="checkIP(this)">🌐 查看出口 IP</button>
         <button class="btn btn-danger" onclick="clearProxy()">✕ 清除代理</button>
       </div>
     </div>
+    <div id="ip-result" style="display:none;margin-top:14px;padding:12px 14px;background:#0f172a;border-radius:8px;font-size:13px;font-family:monospace;line-height:1.8;"></div>
   </div>
 
   <!-- 自定义节点 -->
@@ -726,6 +782,33 @@ async function testProxy() {
 async function clearProxy() {
   await api('/clear', { method: 'POST', body: '{}' });
   await loadStatus();
+}
+
+async function checkIP(btn) {
+  const box = document.getElementById('ip-result');
+  box.style.display = 'block';
+  box.innerHTML = '<span style="color:#64748b">正在检查出口 IP，最多等 15 秒…</span>';
+  btn.disabled = true;
+  try {
+    const d = await api('/ip-check');
+    const directIP  = d.direct_ip?.ip  || '获取失败';
+    const proxyIP   = d.proxy_ip?.ip   || '获取失败';
+    const sameColor = d.same_as_direct ? '#ef4444' : '#22c55e';
+    const sameLabel = d.same_as_direct
+      ? '⚠️  与直连相同 — 换节点不会让 Google 认为是不同 IP'
+      : '✅  不同 — 代理确实换了出口 IP';
+    box.innerHTML = `
+      <div style="color:#94a3b8;margin-bottom:6px">📡 当前网络出口</div>
+      <div><span style="color:#64748b">直连 IP：</span><span style="color:#7dd3fc">${directIP}</span></div>
+      <div><span style="color:#64748b">代理 IP：</span><span style="color:#7dd3fc">${proxyIP}</span></div>
+      <div style="margin-top:8px;color:${sameColor}">${sameLabel}</div>
+      ${d.warning ? `<div style="margin-top:6px;color:#fbbf24;font-size:12px">💡 如果 IP 相同，说明订阅里的节点都通过同一段 IP 出口（常见于 CF 系节点），需要添加其他运营商的节点才能真正分摊额度。</div>` : ''}
+    `;
+  } catch(e) {
+    box.innerHTML = '<span style="color:#ef4444">检查失败：' + e + '</span>';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ── 自定义节点 ────────────────────────────────────────────────────────────────
