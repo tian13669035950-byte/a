@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlparse
 from bs4 import BeautifulSoup
 from typing import Any, AsyncGenerator, Optional
 import primp
+import httpx
 from src.core.config import load_config
 from src.utils.logger import get_logger
 
@@ -136,6 +137,25 @@ class FakeResponse:
             yield line.encode("utf-8") if isinstance(line, str) else line
 
 
+class HttpxStreamingFakeResponse:
+    """httpx 真流式响应封装，aiter_lines() 边收边发，不缓冲整体"""
+
+    def __init__(self, resp: httpx.Response):
+        self._resp = resp
+        self.status_code = resp.status_code
+
+    @property
+    def text(self) -> str:
+        return self._resp.text
+
+    async def aread(self) -> bytes:
+        return await self._resp.aread()
+
+    async def aiter_lines(self):
+        async for line in self._resp.aiter_lines():
+            yield line.encode("utf-8") if isinstance(line, str) else line
+
+
 class MockSession:
     """primp 模式下的占位 session，兼容旧接口中的 session.close() 调用"""
 
@@ -217,31 +237,50 @@ class NetworkClient:
     async def stream_request(self, session: Any, method: str, url: str, headers: dict[str, str], json_data: dict[str, Any]) -> AsyncGenerator[FakeResponse, None]:
         """
         发送流式请求。
-        策略：直连优先，失败才走代理。
+        策略：httpx 直连真流式优先，失败降级到 primp（再失败走 primp 代理）。
+        httpx 支持边收边发（真正流式），primp 会等全部接收完才返回。
         """
         last_exc: Optional[Exception] = None
 
-        # 1. 直连尝试
+        # 1. httpx 直连（真正流式：边收边转发，SillyTavern 等客户端能看到逐字输出）
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), verify=True) as client:
+                async with client.stream(method, url, headers=headers, json=json_data) as resp:
+                    logger.debug(f"httpx 直连 stream 成功, status={resp.status_code}")
+                    yield HttpxStreamingFakeResponse(resp)
+                    return
+        except Exception as e:
+            err_str = str(e)
+            if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+                from src.core.errors import InternalError
+                logger.warning(f"httpx 直连超时，将触发重试: {e}")
+                raise InternalError(message="Upstream request timed out, retrying...")
+            logger.warning(f"httpx 直连 stream 失败，降级 primp: {type(e).__name__}: {e}")
+            last_exc = e
+
+        # 2. primp 直连降级（非真流式，全量缓冲后一次性发出）
         try:
             async with _build_async_client(proxy=None) as client:
                 resp = await client.request(method, url, headers=headers, json=json_data, timeout=60)
+                logger.debug("primp 直连降级成功（非真流式）")
                 yield FakeResponse(resp)
                 return
         except Exception as e:
             err_str = str(e)
             if "timed out" in err_str.lower() or "timeout" in err_str.lower():
                 from src.core.errors import InternalError
-                logger.warning(f"直连请求超时，将触发重试: {e}")
+                logger.warning(f"primp 直连超时，将触发重试: {e}")
                 raise InternalError(message="Upstream request timed out, retrying...")
-            logger.warning(f"直连 stream 失败: {type(e).__name__}: {e}")
+            logger.warning(f"primp 直连 stream 失败: {type(e).__name__}: {e}")
             last_exc = e
 
-        # 2. 代理降级
+        # 3. primp 代理降级
         proxy = _get_proxy() if _socks5_reachable() else None
         if proxy:
             try:
                 async with _build_async_client(proxy=proxy) as client:
                     resp = await client.request(method, url, headers=headers, json=json_data, timeout=60)
+                    logger.debug("primp 代理降级成功（非真流式）")
                     yield FakeResponse(resp)
                     return
             except Exception as e:
@@ -255,4 +294,4 @@ class NetworkClient:
         else:
             if last_exc:
                 raise last_exc
-            raise ConnectionError(f"直连失败且无可用代理: {url}")
+            raise ConnectionError(f"所有方式均失败: {url}")
