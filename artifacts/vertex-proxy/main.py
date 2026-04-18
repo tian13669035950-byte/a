@@ -157,8 +157,12 @@ async def main() -> None:
 
     # 启动后台自动初始化代理（不阻塞服务器）
     asyncio.create_task(_auto_init_proxy())
-    # 启动保活循环（免费容器防休眠）
-    asyncio.create_task(_keepalive_loop(port))
+    # 启动保活循环（仅在 KEEPALIVE=1 时启用；Autoscale 部署应保持关闭，否则会阻止 scale-to-zero）
+    if os.environ.get("KEEPALIVE", "").strip() in ("1", "true", "yes"):
+        asyncio.create_task(_keepalive_loop(port))
+        logger.info("[KeepAlive] 已启用（KEEPALIVE 环境变量设置为开启）")
+    else:
+        logger.info("[KeepAlive] 已禁用（如需开启请设置环境变量 KEEPALIVE=1，仅建议工作区开发时使用）")
 
     try:
         await server.serve()
