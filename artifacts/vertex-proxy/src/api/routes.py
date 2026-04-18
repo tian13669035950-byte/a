@@ -228,21 +228,27 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         """OpenAI 格式的模型列表 (/v1/models)"""
         current_time = int(time.time())
         models: list[str] = _load_models_config()
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": m,
-                    "object": "model",
-                    "created": current_time,
-                    "owned_by": "google",
-                    "permission": [],
-                    "root": m,
-                    "parent": None
-                }
-                for m in models
-            ]
-        }
+        entries = []
+        for m in models:
+            entries.append({
+                "id": m,
+                "object": "model",
+                "created": current_time,
+                "owned_by": "google",
+                "permission": [],
+                "root": m,
+                "parent": None
+            })
+            entries.append({
+                "id": f"fs-{m}",
+                "object": "model",
+                "created": current_time,
+                "owned_by": "google",
+                "permission": [],
+                "root": m,
+                "parent": None
+            })
+        return {"object": "list", "data": entries}
     app.get("/v1/models")(list_models_openai)
 
     async def openai_chat_completions(request: Request) -> StreamingResponse | JSONResponse:
@@ -260,15 +266,22 @@ def create_app(vertex_client: VertexAIClient) -> FastAPI:
         body: dict[str, Any] = cast(dict[str, Any], body_any)
 
         is_stream = bool(body.get("stream", False))
+
+        # 检测假流式前缀 fs-：先收完整响应，再拆成小块逐字发出
+        raw_model = body.get("model", "")
+        fake_stream = isinstance(raw_model, str) and raw_model.startswith("fs-")
+        if fake_stream:
+            body = {**body, "model": raw_model[3:]}  # 去掉 fs- 再传给 Gemini
+
         model, gemini_payload = openai_request_to_gemini(body)
 
-        logger.info(f"[OpenAI] 请求: 模型={model}, 流式={is_stream}")
+        logger.info(f"[OpenAI] 请求: 模型={model}, 流式={is_stream}, 假流式={fake_stream}")
 
         if is_stream:
             async def openai_stream():
                 try:
                     gemini_gen = vertex_client.stream_chat(model=model, gemini_payload=gemini_payload)
-                    async for chunk in stream_gemini_as_openai(gemini_gen, model):
+                    async for chunk in stream_gemini_as_openai(gemini_gen, model, fake_stream=fake_stream):
                         yield chunk
                 except VertexError as e:
                     err_resp = {

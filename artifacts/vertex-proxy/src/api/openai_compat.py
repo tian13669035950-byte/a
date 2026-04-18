@@ -4,6 +4,7 @@
 支持 /v1/chat/completions 和 /v1/models 端点。
 """
 
+import asyncio
 import json
 import time
 import uuid
@@ -385,10 +386,12 @@ def gemini_sse_chunk_to_openai(
 
 async def stream_gemini_as_openai(
     gemini_stream: AsyncGenerator[str, None],
-    model: str
+    model: str,
+    fake_stream: bool = False
 ) -> AsyncGenerator[str, None]:
     """
     将 Gemini SSE 流转换为 OpenAI SSE 流。
+    fake_stream=True 时：收到完整内容后拆成小块逐字发出，模拟流式输出体验。
     """
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -420,6 +423,31 @@ async def stream_gemini_as_openai(
 
             openai_lines = gemini_sse_chunk_to_openai(gemini_json, model, completion_id, created)
             for openai_line in openai_lines:
+                if fake_stream:
+                    # 假流式：解析内容块，把文字拆成每 3 个字符一组逐块发出
+                    try:
+                        data_str = openai_line[6:].strip()
+                        chunk_obj = json.loads(data_str)
+                        delta = chunk_obj.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        finish = chunk_obj.get("choices", [{}])[0].get("finish_reason")
+                        if content and not finish:
+                            TOKEN_SIZE = 3
+                            for i in range(0, len(content), TOKEN_SIZE):
+                                token = content[i:i + TOKEN_SIZE]
+                                token_chunk = {
+                                    "id": completion_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": token}, "finish_reason": None, "logprobs": None}],
+                                    "system_fingerprint": None
+                                }
+                                yield f"data: {json.dumps(token_chunk, ensure_ascii=False)}\n\n"
+                                await asyncio.sleep(0)
+                            continue
+                    except Exception:
+                        pass
                 yield openai_line
 
     yield "data: [DONE]\n\n"
