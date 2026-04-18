@@ -193,25 +193,28 @@ class NetworkClient:
         """
         proxy = _get_proxy() if _socks5_reachable() else None
 
-        # 1. 代理优先（Token 与 Gemini 请求源 IP 一致）
+        # 严格代理模式：有代理时只走代理；代理全失败才允许直连（仅在没配置任何代理时）
         if proxy:
             for attempt in range(3):
                 token = await _do_recaptcha_request(proxy)
                 if token:
-                    logger.debug("代理模式获取 Recaptcha Token 成功（与请求同源 IP）")
+                    logger.debug("代理模式获取 Recaptcha Token 成功")
                     return token
                 logger.warning(f"代理模式 recaptcha 失败 ({attempt+1}/3)")
-            logger.warning("代理模式 recaptcha 全部失败，降级直连兜底")
+                # 失败一次就换节点继续试（同 IP 一致性原则）
+                new_proxy = _rotate_proxy()
+                if new_proxy:
+                    proxy = new_proxy
+            logger.error("Recaptcha Token 全代理尝试均失败，已轮换节点仍失败")
+            return None
 
-        # 2. 直连兜底（IP 不一致，可能触发反欺诈，但聊胜于无）
+        # 没有代理才走直连
         for attempt in range(3):
             token = await _do_recaptcha_request(None)
             if token:
-                logger.debug("直连模式获取 Recaptcha Token 成功（注意：与代理 IP 不一致）")
                 return token
             logger.debug(f"直连 recaptcha 失败 ({attempt+1}/3)")
-
-        logger.error("Recaptcha Token 获取失败（代理+直连均已尝试）")
+        logger.error("Recaptcha Token 获取失败")
         return None
 
     def create_session(self) -> MockSession:
@@ -225,33 +228,36 @@ class NetworkClient:
         """
         proxy = _get_proxy() if _socks5_reachable() else None
 
-        # 1. httpx + 代理（不同 IP，配额独立）
+        # 严格代理模式：配置了代理就只走代理（不烧 Replit IP）
         if proxy:
-            try:
-                async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(45.0), verify=True) as client:
-                    resp = await client.post(url, headers=headers, json=json_data)
-                    logger.debug(f"httpx 代理 POST 成功, status={resp.status_code}")
-                    return HttpxStreamingFakeResponse(resp)
-            except Exception as e:
-                logger.warning(f"httpx 代理 POST 失败，降级直连: {type(e).__name__}: {e}")
+            last_exc: Optional[Exception] = None
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(45.0), verify=True) as client:
+                        resp = await client.post(url, headers=headers, json=json_data)
+                        logger.debug(f"httpx 代理 POST 成功, status={resp.status_code}")
+                        return HttpxStreamingFakeResponse(resp)
+                except Exception as e:
+                    last_exc = e
+                    logger.warning(f"httpx 代理 POST 失败 ({attempt+1}/3): {type(e).__name__}: {e}")
+                    new_proxy = _rotate_proxy()
+                    if new_proxy:
+                        proxy = new_proxy
+                        logger.info("已切换到下一个代理节点")
+                    else:
+                        break
+            logger.error(f"所有代理 POST 失败，未降级直连以保护 IP 配额")
+            raise last_exc if last_exc else RuntimeError("所有代理节点均失败")
 
-        # 2. httpx 直连降级
+        # 完全没配置代理时才允许直连
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(45.0), verify=True) as client:
                 resp = await client.post(url, headers=headers, json=json_data)
-                logger.debug(f"httpx 直连 POST 成功, status={resp.status_code}")
                 return HttpxStreamingFakeResponse(resp)
         except Exception as e:
-            logger.warning(f"httpx 直连 POST 失败，降级 primp: {type(e).__name__}: {e}")
-
-        # 3. primp 直连兜底
-        try:
             async with _build_async_client(proxy=None) as client:
                 resp = await client.post(url, headers=headers, json=json_data, timeout=30)
                 return FakeResponse(resp)
-        except Exception as e:
-            logger.error(f"所有方式 POST 均失败: {type(e).__name__}: {e}")
-            raise
 
     async def stream_request(self, session: Any, method: str, url: str, headers: dict[str, str], json_data: dict[str, Any]) -> AsyncGenerator[FakeResponse, None]:
         """
@@ -287,39 +293,22 @@ class NetworkClient:
                     logger.info(f"已切换到新代理节点，继续重试")
                 else:
                     break  # 无更多节点可用
+        # 严格代理模式：有代理时绝不降级直连
         if proxy_attempts > 0:
-            logger.warning("代理 stream 全部失败，降级直连")
+            logger.error("所有代理 stream 失败，未降级直连以保护 IP 配额")
+            if last_exc:
+                raise last_exc
+            from src.core.errors import InternalError
+            raise InternalError(message="所有代理节点均不可用，请检查节点状态")
 
-        # 2. httpx 直连降级（真正流式，同 Replit IP，配额有限）
+        # 完全没配置代理时才允许直连
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), verify=True) as client:
                 async with client.stream(method, url, headers=headers, json=json_data) as resp:
-                    logger.debug(f"httpx 直连 stream 成功, status={resp.status_code}")
                     yield HttpxStreamingFakeResponse(resp)
                     return
         except Exception as e:
-            err_str = str(e)
-            if "timed out" in err_str.lower() or "timeout" in err_str.lower():
-                from src.core.errors import InternalError
-                logger.warning(f"httpx 直连超时，将触发重试: {e}")
-                raise InternalError(message="Upstream request timed out, retrying...")
-            logger.warning(f"httpx 直连 stream 失败，降级 primp: {type(e).__name__}: {e}")
-            last_exc = e
-
-        # 3. primp 直连兜底（非真流式）
-        try:
             async with _build_async_client(proxy=None) as client:
                 resp = await client.request(method, url, headers=headers, json=json_data, timeout=60)
-                logger.debug("primp 直连兜底成功（非真流式）")
                 yield FakeResponse(resp)
                 return
-        except Exception as e:
-            err_str = str(e)
-            if "timed out" in err_str.lower() or "timeout" in err_str.lower():
-                from src.core.errors import InternalError
-                logger.warning(f"primp 直连超时，将触发重试: {e}")
-                raise InternalError(message="Upstream request timed out, retrying...")
-            logger.error(f"所有方式 stream 均失败: {type(e).__name__}: {e}")
-            if last_exc:
-                raise last_exc
-            raise
