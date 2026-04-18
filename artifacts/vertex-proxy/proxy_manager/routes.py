@@ -613,27 +613,54 @@ async def quota_scan(request: Request):
     _quota_current = -1
     nodes_snap = list(_cached_nodes[:nodes_to_check])
 
-    def _check_node_sync(node: dict, timeout: float = 7.0) -> str:
-        """同步：启动 xray，用 httpx SOCKS5 打 google/generate_204 检测"""
+    # 轮流用这两个模型检测真实 Gemini 配额（不只是连通性）
+    SCAN_MODELS = ["gemini-2.5-pro", "gemini-3.1-pro-preview"]
+
+    def _check_node_sync(node: dict, model_name: str, timeout: float = 25.0) -> str:
+        """同步：启动 xray，调本地 /v1/chat/completions 用真实 Gemini 模型试一句话"""
         try:
-            ok, msg = start_xray(node)
+            ok, _msg = start_xray(node)
             if not ok:
                 return "dead"
             time.sleep(0.5)  # xray 内部已 sleep(1.5)，再稍等让端口就绪
             try:
                 import httpx
-                with httpx.Client(
-                    proxy="socks5://127.0.0.1:1080",
-                    timeout=timeout,
-                    follow_redirects=False,
-                ) as client:
-                    r = client.get("https://www.google.com/generate_204")
+                payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                    "max_tokens": 8,
+                }
+                headers = {
+                    "Authorization": "Bearer sk-123456",
+                    "Content-Type": "application/json",
+                }
+                with httpx.Client(timeout=timeout) as client:
+                    r = client.post(
+                        "http://127.0.0.1:8000/v1/chat/completions",
+                        json=payload,
+                        headers=headers,
+                    )
                     if r.status_code == 429:
                         return "exhausted"
-                    elif r.status_code in (204, 200, 301, 302):
-                        return "ok"
-                    else:
+                    if r.status_code != 200:
                         return "dead"
+                    try:
+                        body = r.json()
+                    except Exception:
+                        return "dead"
+                    # 检查是否真的有内容返回
+                    choices = body.get("choices") or []
+                    if not choices:
+                        return "dead"
+                    msg = (choices[0] or {}).get("message") or {}
+                    content = (msg.get("content") or "").strip()
+                    if content:
+                        return "ok"
+                    # 有 200 但空内容 → 节点能连但模型没出结果，视为耗尽
+                    return "exhausted"
+            except httpx.TimeoutException:
+                return "dead"
             except Exception:
                 return "dead"
         except Exception:
@@ -646,7 +673,8 @@ async def quota_scan(request: Request):
             for i, node in enumerate(nodes_snap):
                 _quota_current = i
                 _quota_results[i] = "checking"
-                status = await loop.run_in_executor(None, _check_node_sync, node)
+                model_name = SCAN_MODELS[i % len(SCAN_MODELS)]
+                status = await loop.run_in_executor(None, _check_node_sync, node, model_name)
                 _quota_results[i] = status
         finally:
             _quota_current = -1
