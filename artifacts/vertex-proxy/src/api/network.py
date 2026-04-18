@@ -210,39 +210,65 @@ class NetworkClient:
     async def post_request(self, session: Any, url: str, headers: dict[str, str], json_data: dict[str, Any]) -> FakeResponse:
         """
         发送非流式 POST 请求。
-        策略：直连优先，失败才走代理。
-        （cloudconsole-pa.clients6.google.com 从生产服务器可直连，但CF socks5代理无法到达）
+        策略：代理优先（不同 IP 分摊配额），失败降级直连。
         """
-        # 1. 直连尝试
+        proxy = _get_proxy() if _socks5_reachable() else None
+
+        # 1. httpx + 代理（不同 IP，配额独立）
+        if proxy:
+            try:
+                async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(45.0), verify=True) as client:
+                    resp = await client.post(url, headers=headers, json=json_data)
+                    logger.debug(f"httpx 代理 POST 成功, status={resp.status_code}")
+                    return HttpxStreamingFakeResponse(resp)
+            except Exception as e:
+                logger.warning(f"httpx 代理 POST 失败，降级直连: {type(e).__name__}: {e}")
+
+        # 2. httpx 直连降级
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0), verify=True) as client:
+                resp = await client.post(url, headers=headers, json=json_data)
+                logger.debug(f"httpx 直连 POST 成功, status={resp.status_code}")
+                return HttpxStreamingFakeResponse(resp)
+        except Exception as e:
+            logger.warning(f"httpx 直连 POST 失败，降级 primp: {type(e).__name__}: {e}")
+
+        # 3. primp 直连兜底
         try:
             async with _build_async_client(proxy=None) as client:
                 resp = await client.post(url, headers=headers, json=json_data, timeout=30)
                 return FakeResponse(resp)
         except Exception as e:
-            logger.warning(f"直连 POST 失败: {type(e).__name__}: {e}")
-
-        # 2. 代理降级
-        proxy = _get_proxy() if _socks5_reachable() else None
-        if proxy:
-            try:
-                async with _build_async_client(proxy=proxy) as client:
-                    resp = await client.post(url, headers=headers, json=json_data, timeout=30)
-                    return FakeResponse(resp)
-            except Exception as e:
-                logger.error(f"代理 POST 也失败: {type(e).__name__}: {e}")
-                raise
-        else:
-            raise ConnectionError(f"直连失败且无可用代理: {url}")
+            logger.error(f"所有方式 POST 均失败: {type(e).__name__}: {e}")
+            raise
 
     async def stream_request(self, session: Any, method: str, url: str, headers: dict[str, str], json_data: dict[str, Any]) -> AsyncGenerator[FakeResponse, None]:
         """
         发送流式请求。
-        策略：httpx 直连真流式优先，失败降级到 primp（再失败走 primp 代理）。
+        策略：代理优先（不同 IP 分摊配额），失败才直连。
         httpx 支持边收边发（真正流式），primp 会等全部接收完才返回。
         """
+        proxy = _get_proxy() if _socks5_reachable() else None
         last_exc: Optional[Exception] = None
 
-        # 1. httpx 直连（真正流式：边收边转发，SillyTavern 等客户端能看到逐字输出）
+        # 1. httpx + 代理（不同 IP，配额独立，真正流式）
+        if proxy:
+            try:
+                async with httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(60.0), verify=True) as client:
+                    async with client.stream(method, url, headers=headers, json=json_data) as resp:
+                        logger.debug(f"httpx 代理 stream 成功, status={resp.status_code}")
+                        yield HttpxStreamingFakeResponse(resp)
+                        return
+            except Exception as e:
+                err_str = str(e)
+                if "timed out" in err_str.lower() or "timeout" in err_str.lower():
+                    from src.core.errors import InternalError
+                    logger.warning(f"代理 stream 超时，将触发重试: {e}")
+                    raise InternalError(message="Upstream request timed out, retrying...")
+                logger.warning(f"httpx 代理 stream 失败，降级直连: {type(e).__name__}: {e}")
+                last_exc = e
+
+        # 2. httpx 直连降级（真正流式，同 Replit IP，配额有限）
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(60.0), verify=True) as client:
                 async with client.stream(method, url, headers=headers, json=json_data) as resp:
@@ -258,11 +284,11 @@ class NetworkClient:
             logger.warning(f"httpx 直连 stream 失败，降级 primp: {type(e).__name__}: {e}")
             last_exc = e
 
-        # 2. primp 直连降级（非真流式，全量缓冲后一次性发出）
+        # 3. primp 直连兜底（非真流式）
         try:
             async with _build_async_client(proxy=None) as client:
                 resp = await client.request(method, url, headers=headers, json=json_data, timeout=60)
-                logger.debug("primp 直连降级成功（非真流式）")
+                logger.debug("primp 直连兜底成功（非真流式）")
                 yield FakeResponse(resp)
                 return
         except Exception as e:
@@ -271,27 +297,7 @@ class NetworkClient:
                 from src.core.errors import InternalError
                 logger.warning(f"primp 直连超时，将触发重试: {e}")
                 raise InternalError(message="Upstream request timed out, retrying...")
-            logger.warning(f"primp 直连 stream 失败: {type(e).__name__}: {e}")
-            last_exc = e
-
-        # 3. primp 代理降级
-        proxy = _get_proxy() if _socks5_reachable() else None
-        if proxy:
-            try:
-                async with _build_async_client(proxy=proxy) as client:
-                    resp = await client.request(method, url, headers=headers, json=json_data, timeout=60)
-                    logger.debug("primp 代理降级成功（非真流式）")
-                    yield FakeResponse(resp)
-                    return
-            except Exception as e:
-                err_str = str(e)
-                if "timed out" in err_str.lower() or "timeout" in err_str.lower():
-                    from src.core.errors import InternalError
-                    logger.warning(f"代理请求超时，将触发重试: {e}")
-                    raise InternalError(message="Upstream request timed out, retrying...")
-                logger.error(f"代理 stream 也失败: {type(e).__name__}: {e}")
-                raise
-        else:
+            logger.error(f"所有方式 stream 均失败: {type(e).__name__}: {e}")
             if last_exc:
                 raise last_exc
-            raise ConnectionError(f"所有方式均失败: {url}")
+            raise
